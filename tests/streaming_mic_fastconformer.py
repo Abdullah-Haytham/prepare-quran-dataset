@@ -521,13 +521,15 @@ def build_demo(
 # ----------------------------------------------------------------------
 
 
-def load_model_and_vocab(model_id: str, device: str | torch.device):
-    model = FastConformerCacheAwareMultilevelCTC.from_pretrained(model_id)
+def load_model_and_vocab(
+    model_id: str, device: str | torch.device, token: str | None = None
+):
+    model = FastConformerCacheAwareMultilevelCTC.from_pretrained(model_id, token=token)
     model.to(device)
     model.eval()
     model.processor.to(device)  # processor is not an nn.Module; model.to() skips it
     model.setup_streaming_params()
-    vocab_path = hf_hub_download(model_id, "vocab.json")
+    vocab_path = hf_hub_download(model_id, "vocab.json", token=token)
     with open(vocab_path, encoding="utf-8") as f:
         vocab = json.load(f)
     return model, vocab
