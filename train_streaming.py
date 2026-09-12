@@ -11,11 +11,12 @@ import string
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Union
+from typing import Any, Literal
 
 import Levenshtein
 import librosa
 import numpy as np
+import soundfile as sf
 import torch
 import yaml
 from datasets import (
@@ -29,6 +30,7 @@ from datasets import (
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 from huggingface_hub import login as hf_login
+from jax.numpy import ndarray
 from numpy.typing import NDArray
 from pydantic import BaseModel, Field, field_validator, model_validator
 from qdat_bench.audio_utils import decode_audio
@@ -115,7 +117,9 @@ class TrainConfig(BaseModel):
     from_nemo_model_name_or_path: str | None = None
 
     # Streaming data/training-level fields
-    max_noise_input_seconds: float = 40.0
+    max_noise_input_seconds: float = (
+        40.0  # TODO: unecssary but for backcomptabilty we will leave it
+    )
     include_noise_ds_in_train: bool = True
     include_noise_ds_in_augment: bool = True
 
@@ -123,6 +127,7 @@ class TrainConfig(BaseModel):
     # concatenates it with the training data. Tlog samples already contain
     # phonemes so they skip phonetization; sifat is empty for them.
     add_tlog_dataset: bool = False
+    tlog_limit: int | None = None
     add_eos_token: bool = True
 
     @classmethod
@@ -473,12 +478,43 @@ def fix_dataset_len(ds: Dataset, batch_size: int) -> Dataset:
     return ds.select(range(ds_len))
 
 
+def sample_ids(N: int, limit: int, seed: int | None = None) -> NDArray:
+    """Shuffle a range of integers and return the chosed random ids
+
+    Args:
+        N (int): Size of the original range (0 to N-1).
+        limit (int): Number of elements to select after shuffling.
+        seed (int, optional): Seed for the random number generator.
+            Defaults to None.
+
+    Returns:
+        NdArray: array of selected ids
+    """
+    arr = np.arange(N)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(arr)
+    return arr[:limit]
+
+
+def encode_flac_bytes(audio_bytes: bytes, sample_rate: int = 16000) -> bytes:
+    """Decode raw audio bytes and re-encode as ``sample_rate`` mono lossless FLAC.
+
+    librosa's int16 -> float32 -> PCM_16 round-trip is exact (float32's 24-bit
+    mantissa holds every int16 value precisely), so when the source is already
+    16-bit PCM at the target rate the decoded FLAC is bit-for-bit identical to
+    the input; otherwise this standardizes the sample on that rate/bit-depth.
+    """
+    wav, _ = librosa.load(io.BytesIO(audio_bytes), sr=sample_rate, mono=True)
+    buf = io.BytesIO()
+    sf.write(buf, wav, sample_rate, format="FLAC", subtype="PCM_16")
+    return buf.getvalue()
+
+
 def prepare_noise_dataset(
     train_config: TrainConfig,
     augmentation_ratio: float = 0.3,
     extend_seconds: float = 1.0,
     extended_seconds_threshold: float = 10.0,
-    all_noise_as_input: bool = False,
 ) -> dict:
     """Split noise dataset into augmentation + input parts.
 
@@ -491,68 +527,155 @@ def prepare_noise_dataset(
     )
     noise_ds = noise_ds.cast_column("audio", Audio(decode=False))
 
-    split_ds = noise_ds.train_test_split(
-        test_size=augmentation_ratio,
-        generator=np.random.default_rng(train_config.seed),
-    )
-    aug_ds = split_ds["test"]
-    if all_noise_as_input:
-        input_ds = noise_ds
-    else:
-        input_ds = split_ds["train"]
-
     hf_cache = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
     noise_dir = Path(hf_cache) / "noise-dir"
 
     if not noise_dir.exists():
         noise_dir.mkdir(parents=True, exist_ok=True)
-        import soundfile as sf
 
-        for i, example in enumerate(tqdm(aug_ds, desc="Saving noise samples")):
+        # NOTE: augmentation noise and noise train data set are operalpped
+        noise_ids = sample_ids(
+            len(noise_ds),
+            limit=int(augmentation_ratio * len(noise_ds)),
+            seed=train_config.seed,
+        )
+        for idx in tqdm(noise_ids, desc="Saving noise samples"):
+            example = noise_ds[idx]
             audio_dict = example["audio"]
             src = io.BytesIO(audio_dict["bytes"])
             wav, sr = librosa.load(src, sr=16000, mono=True)
             if len(wav) / sr < extended_seconds_threshold:
                 extend_len = int(extend_seconds * sr)
                 wav = np.pad(wav, (0, extend_len))
-            sf.write(str(noise_dir / f"noise_{i:06d}.wav"), wav, sr)
+            sf.write(str(noise_dir / f"noise_{idx:06d}.wav"), wav, sr)
 
-    input_ds = input_ds.add_column("input_type", ["silence"] * input_ds.num_rows)
+    noise_ds = noise_ds.add_column("input_type", ["silence"] * noise_ds.num_rows)
+    noise_ds = noise_ds.remove_columns(
+        [
+            "title",
+            "description",
+            "tags",
+            "username",
+            "freesound_id",
+            "license",
+            "attribution_required",
+            "commercial_use",
+        ]
+    )
 
-    return {"augmentation": str(noise_dir), "input": input_ds}
+    # Standardize all input noise on embedded 16 kHz mono lossless FLAC bytes,
+    # matching the muaalem dataset so every sample feeds the collator identically.
+    noise_ds = noise_ds.map(
+        lambda ex: {
+            **ex,
+            "audio": {
+                "bytes": encode_flac_bytes(ex["audio"]["bytes"]),
+                "path": None,
+            },
+        },
+        num_proc=train_config.num_workers,
+    )
+
+    return {"augmentation": str(noise_dir), "input": noise_ds}
 
 
-def prepare_dataset(
+def prepare_muaalem_dataset(
     train_config: TrainConfig,
-    processor,
-    multi_level_tokenizer: MultiLevelTokenizer,
-    sample_rate=16000,
-    is_testset=False,
-    input_noise_ds: Dataset | None = None,
-):
+    moshaf_id_to_moshaf_attr: dict[str, MoshafAttributes],
+    special_moshaf_id_to_seg_to_moshaf_attr: dict[str, dict[str, MoshafAttributes]],
+    is_testset: bool = False,
+) -> Dataset:
+    """Load the muaalem dataset for the selected moshaf ids and phonetize it.
+
+    Adds ``phonemes`` and ``sifat`` columns that the data collator then uses for
+    tokenization (moved out of the collator into dataset preparation).
+
+    Args:
+        train_config: Training config; selects moshaf ids (train vs test).
+        moshaf_id_to_moshaf_attr: Mapping from moshaf ID to ``MoshafAttributes``.
+        special_moshaf_id_to_seg_to_moshaf_attr: Per-segment moshaf attribute
+            overrides for phonetization.
+        is_testset: If True, use ``test_moshaf_ids``, else ``train_moshaf_ids``.
+
+    Returns:
+        The prepared muaalem dataset (with ``phonemes``/``sifat`` columns).
+    """
     if is_testset:
         moshaf_ids = train_config.test_moshaf_ids
     else:
         moshaf_ids = train_config.train_moshaf_ids
-    if train_config.train_moshaf_ids:
-        # concatenate datasets
-        ds = concatenate_datasets(
-            [
-                load_dataset(
-                    "obadx/muaalem-annotated-v3",
-                    name=f"moshaf_{m_id}",
-                    split="train",
-                    num_proc=train_config.num_workers,
-                )
-                for m_id in moshaf_ids
-            ]
+
+    def _resolve_moshaf_attr(m_id: str, seg_idx) -> MoshafAttributes:
+        if m_id in special_moshaf_id_to_seg_to_moshaf_attr:
+            if seg_idx in special_moshaf_id_to_seg_to_moshaf_attr[m_id]:
+                return special_moshaf_id_to_seg_to_moshaf_attr[m_id][seg_idx]
+        return moshaf_id_to_moshaf_attr[m_id]
+
+    def _phonetize(example: dict) -> dict:
+        moshaf_attr = _resolve_moshaf_attr(
+            example["moshaf_id"], example["segment_index"]
+        )
+        phonized = quran_phonetizer(
+            example["uthmani"],
+            moshaf_attr,
+            remove_spaces=True,
         )
 
-        # disable torchcodec decoding, use liborsa instead
-        ds = ds.cast_column("audio", Audio(decode=False))
+        # Re-encode the embedded audio as 16 kHz mono FLAC bytes.
+        # The muaalem dataset ships 16-bit PCM WAVs already at 16 kHz, and
+        # librosa's int16 -> float32 -> PCM_16 round-trip is exact (float32's
+        # 24-bit mantissa holds every int16 value precisely), so writing the
+        # waveform back as PCM_16 FLAC is bit-for-bit lossless: decoding this
+        # FLAC yields samples identical to the original WAV. FLAC also compresses
+        # losslessly (~half the size), so the cached dataset stays smaller while
+        # preserving identical audio. Setting `path` to None standardizes every
+        # sample on embedded FLAC bytes, so all downstream consumers (the data
+        # collator, augmentation, and the max-length filter) read identical audio.
+        return {
+            **example,
+            "audio": {
+                "bytes": encode_flac_bytes(example["audio"]["bytes"]),
+                "path": None,
+            },
+            "phonemes": phonized.phonemes,
+            "sifat": [s.model_dump() for s in phonized.sifat],
+        }
 
+    # concatenate datasets
+    ds = concatenate_datasets(
+        [
+            load_dataset(
+                "obadx/muaalem-annotated-v3",
+                name=f"moshaf_{m_id}",
+                split="train",
+                num_proc=train_config.num_workers,
+            )
+            for m_id in moshaf_ids
+        ]
+    )
+
+    # disable torchcodec decoding, use librosa instead
+    ds = ds.cast_column("audio", Audio(decode=False))
+
+    ds = ds.map(_phonetize, num_proc=train_config.num_workers)
+
+    return ds
+
+
+def prepare_dataset(
+    train_config: TrainConfig,
+    muaalem_ds: Dataset | None = None,
+    sample_rate=16000,
+    is_testset=False,
+    input_noise_ds: Dataset | None = None,
+):
+    ds_list = []
+    if muaalem_ds is not None:
         # Add input_type column to speech samples
-        ds = ds.add_column("input_type", ["speech"] * ds.num_rows)
+        muaalem_ds = muaalem_ds.add_column(
+            "input_type", ["speech"] * muaalem_ds.num_rows
+        )
+        ds_list.append(muaalem_ds)
 
     if train_config.add_tlog_dataset and not is_testset:
         tlog_path = (
@@ -566,12 +689,22 @@ def prepare_dataset(
                 "Run build_tlog_clean_16k.py first to build it."
             )
         tlog_ds = load_from_disk(str(tlog_path))
+        if train_config.tlog_limit is not None:
+            tlog_ds.select(
+                sample_ids(
+                    len(tlog_ds),
+                    train_config.tlog_limit,
+                    seed=train_config.seed,
+                )
+            )
         tlog_ds = tlog_ds.cast_column("audio", Audio(decode=False))
         tlog_ds = tlog_ds.add_column("uthmani", [""] * tlog_ds.num_rows)
         tlog_ds = tlog_ds.add_column("moshaf_id", [""] * tlog_ds.num_rows)
         tlog_ds = tlog_ds.add_column("segment_index", ["-1"] * tlog_ds.num_rows)
         tlog_ds = tlog_ds.add_column("input_type", ["speech"] * tlog_ds.num_rows)
-        ds = concatenate_datasets([ds, tlog_ds])
+        tlog_ds = tlog_ds.rename_column("predicted_phonemes", "phonemes")
+        tlog_ds = tlog_ds.add_column("sifat", [[]] * tlog_ds.num_rows)
+        ds_list.append(tlog_ds)
 
     # Filtering speech samples > max_audio_seconds
     def _audio_len(audio_dict):
@@ -579,15 +712,10 @@ def prepare_dataset(
         wav, _ = librosa.load(src, sr=16000, mono=True)
         return len(wav)
 
-    if train_config.max_audio_seconds is not None:
-        # removihg long samples
-        max_samples = int(train_config.max_audio_seconds * sample_rate)
-        ds = ds.filter(
-            lambda ex: _audio_len(ex["audio"]) <= max_samples,
-            # num_proc=train_config.num_workers, #BUG: from python: https://github.com/python/cpython/issues/148914
-        )
-
     if input_noise_ds is not None:
+        # Forcing silence samples to have all padding label with target_length zero
+        # This will teach model with CTC loss to emit padding tokens on silence samples
+        # (phonemes/sifat are pre-populated during dataset preparation)
         input_noise_ds = input_noise_ds.cast_column("audio", Audio(decode=False))
         input_noise_ds = input_noise_ds.add_column(
             "uthmani", [""] * input_noise_ds.num_rows
@@ -598,22 +726,22 @@ def prepare_dataset(
         input_noise_ds = input_noise_ds.add_column(
             "segment_index", ["-1"] * input_noise_ds.num_rows
         )
-        input_noise_ds = input_noise_ds.remove_columns(
-            [
-                "title",
-                "description",
-                "tags",
-                "username",
-                "freesound_id",
-                "license",
-                "attribution_required",
-                "commercial_use",
-            ]
+        input_noise_ds = input_noise_ds.add_column(
+            "phonemes", [""] * input_noise_ds.num_rows
         )
-        if train_config.train_moshaf_ids:
-            ds = concatenate_datasets([ds, input_noise_ds])
-        else:
-            ds = input_noise_ds
+        input_noise_ds = input_noise_ds.add_column(
+            "sifat", [[]] * input_noise_ds.num_rows
+        )
+        ds_list.append(input_noise_ds)
+
+    ds = concatenate_datasets(ds_list)
+    if train_config.max_audio_seconds is not None:
+        # removihg long samples
+        max_samples = int(train_config.max_audio_seconds * sample_rate)
+        ds = ds.filter(
+            lambda ex: _audio_len(ex["audio"]) <= max_samples,
+            num_proc=train_config.num_workers,
+        )
 
     if is_testset:
         return DatasetDict(
@@ -764,10 +892,7 @@ class QdatBenchCollator:
 class DataCollatorCTCWithPadding:
     processor: Wav2Vec2BertProcessor | FastConformerMelProcessor | None
     multi_level_tokenizer: MultiLevelTokenizer
-    moshaf_id_to_moshaf_attr: dict[str, MoshafAttributes]
     augment: Augment
-    special_moshaf_id_to_seg_to_moshaf_attr: dict[str, dict[str, MoshafAttributes]]
-    max_noise_input_seconds: float = 40.0
     chunk_frames: int = 25
     sample_rate: int = 16000
     architecture: ArchitectureName = "w2v2bert-streaming-rnn"
@@ -775,8 +900,8 @@ class DataCollatorCTCWithPadding:
     add_eos_token: bool = True
 
     def __call__(
-        self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
-    ) -> Dict[str, torch.Tensor]:
+        self, features: list[dict[str, list[int] | torch.Tensor]]
+    ) -> dict[str, torch.Tensor]:
         # split inputs and labels since they have to be of different lengths and need
         # different padding methods
         waves = []
@@ -785,7 +910,6 @@ class DataCollatorCTCWithPadding:
         features_input_types = []
 
         min_silence_samples = self.chunk_frames * 20 * self.sample_rate // 1000
-        max_silence_samples = int(self.max_noise_input_seconds * self.sample_rate)
 
         for f in features:
             audio_dict = f["audio"]
@@ -798,42 +922,19 @@ class DataCollatorCTCWithPadding:
                 # Enforce min length (chunk_frames * 20ms)
                 if len(wav) < min_silence_samples:
                     wav = np.pad(wav, (0, min_silence_samples - len(wav)))
-                # Enforce max length
-                if len(wav) > max_silence_samples:
-                    wav = wav[:max_silence_samples]
+
             else:
                 if self.apply_augment:
                     wav = self.augment.apply(wav)
 
             waves.append(wav)
 
-        for idx in range(len(features)):
-            if features_input_types[idx] == "silence":
-                phonemes_list.append("")
-                sifat_list.append([])
-            elif features[idx].get("predicted_phonemes"):
-                phonemes_list.append(features[idx]["predicted_phonemes"])
-                sifat_list.append([])
-            else:
-                m_id = features[idx]["moshaf_id"]
-                if m_id in self.special_moshaf_id_to_seg_to_moshaf_attr:
-                    seg_idx = features[idx]["segment_index"]
-                    if seg_idx in self.special_moshaf_id_to_seg_to_moshaf_attr[m_id]:
-                        moshaf_attr = self.special_moshaf_id_to_seg_to_moshaf_attr[
-                            m_id
-                        ][seg_idx]
-                    else:
-                        moshaf_attr = self.moshaf_id_to_moshaf_attr[m_id]
-                else:
-                    moshaf_attr = self.moshaf_id_to_moshaf_attr[m_id]
-
-                phonized = quran_phonetizer(
-                    features[idx]["uthmani"],
-                    moshaf_attr,
-                    remove_spaces=True,
-                )
-                phonemes_list.append(phonized.phonemes)
-                sifat_list.append(phonized.sifat)
+            # Forcing silence samples to have all padding label with target_length zero by making
+            # `phonemes` column with empty string "" see prepare_dataset function
+            # This will teach model with CTC loss to emit padding tokens on silence samples
+            # (phonemes/sifat are pre-populated during dataset preparation)
+            phonemes_list.append(f["phonemes"])
+            sifat_list.append(f["sifat"])
 
         if self.architecture == "fastconformer-cache-aware":
             batch = asdict(nemo_fasterconformer_preprocesor(waves, self.processor))
@@ -1199,8 +1300,6 @@ def run_streaming_testset_test(
     testset: DatasetDict,
     output_dir: str | Path,
     vocab: dict[str, dict[str, int]],
-    moshaf_id_to_moshaf_attr: dict[str, MoshafAttributes],
-    special_moshaf_id_to_seg_to_moshaf_attr: dict[str, dict[str, MoshafAttributes]],
     device: torch.device,
     dtype: torch.dtype,
     batch_size: int,
@@ -1226,10 +1325,6 @@ def run_streaming_testset_test(
             loaded via ``prepare_dataset``).
         output_dir: Path to save the results JSON file.
         vocab: Dict mapping level name -> {label: id} (from ``vocab.json``).
-        moshaf_id_to_moshaf_attr: Mapping from moshaf ID to
-            ``MoshafAttributes``.
-        special_moshaf_id_to_seg_to_moshaf_attr: Per-segment moshaf
-            attribute overrides.
         device: torch device (cuda/cpu).
         dtype: torch dtype (bfloat16/float32).
         batch_size: Number of audio samples to stream simultaneously.
@@ -1242,9 +1337,7 @@ def run_streaming_testset_test(
     collator = DataCollatorCTCWithPadding(
         processor=processor,
         multi_level_tokenizer=multi_level_tokenizer,
-        moshaf_id_to_moshaf_attr=moshaf_id_to_moshaf_attr,
         augment=Augment(),
-        special_moshaf_id_to_seg_to_moshaf_attr=special_moshaf_id_to_seg_to_moshaf_attr,
         architecture="fastconformer-cache-aware",
         apply_augment=False,
         add_eos_token=add_eos_token,
@@ -1557,12 +1650,15 @@ if __name__ == "__main__":
         else None
     )
 
-    # Load dataset
-    # Update with your dataset path
+    # Load & phonetize the muaalem dataset, then prepare the full dataset
+    muaalem_ds = prepare_muaalem_dataset(
+        train_config,
+        moshaf_id_to_moshaf_attr,
+        special_moshaf_id_to_seg_to_moshaf_attr,
+    )
     dataset = prepare_dataset(
         train_config,
-        processor,
-        multi_level_tokenizer,
+        muaalem_ds=muaalem_ds,
         input_noise_ds=input_noise_ds,
     )
 
@@ -1605,14 +1701,11 @@ if __name__ == "__main__":
     data_collector = DataCollatorCTCWithPadding(
         processor=processor,
         multi_level_tokenizer=multi_level_tokenizer,
-        moshaf_id_to_moshaf_attr=moshaf_id_to_moshaf_attr,
         augment=Augment(
             augment_prob=train_config.augment_prob,
             seed=train_config.seed,
             noise_dir_path=noise_dir_path,
         ),
-        special_moshaf_id_to_seg_to_moshaf_attr=special_moshaf_id_to_seg_to_moshaf_attr,
-        max_noise_input_seconds=train_config.max_noise_input_seconds,
         chunk_frames=train_config.model_kwargs.get("chunk_frames", 25),
         architecture=train_config.architecture,
         add_eos_token=train_config.add_eos_token,
@@ -1682,7 +1775,16 @@ if __name__ == "__main__":
             )
         else:
             testset = prepare_dataset(
-                train_config, processor, multi_level_tokenizer, is_testset=True
+                train_config,
+                processor,
+                multi_level_tokenizer,
+                muaalem_ds=prepare_muaalem_dataset(
+                    train_config,
+                    moshaf_id_to_moshaf_attr,
+                    special_moshaf_id_to_seg_to_moshaf_attr,
+                    is_testset=True,
+                ),
+                is_testset=True,
             )
             test_results = trainer.evaluate(
                 testset["test"], metric_key_prefix="test_", apply_augment=False
@@ -1785,6 +1887,12 @@ if __name__ == "__main__":
                     train_config,
                     processor,
                     multi_level_tokenizer,
+                    muaalem_ds=prepare_muaalem_dataset(
+                        train_config,
+                        moshaf_id_to_moshaf_attr,
+                        special_moshaf_id_to_seg_to_moshaf_attr,
+                        is_testset=True,
+                    ),
                     is_testset=True,
                 )
                 run_streaming_testset_test(
@@ -1794,8 +1902,6 @@ if __name__ == "__main__":
                     testset=testset,
                     output_dir=train_config.output_dir,
                     vocab=vocab,
-                    moshaf_id_to_moshaf_attr=moshaf_id_to_moshaf_attr,
-                    special_moshaf_id_to_seg_to_moshaf_attr=special_moshaf_id_to_seg_to_moshaf_attr,
                     device=device,
                     dtype=dtype,
                     batch_size=streaming_batch_size,
