@@ -8,9 +8,9 @@ include-package-data = true # to include data directories
 
 [project]
 name = "prepare-quran-dataset"
-version = "1.0.0"
+version = "2.0.0"
 authors = [
-  { name="Abdullah Aml", email="abdullahamlyossef@gmail.com" },
+  { name="Quran Muaalem Team", email="quran.muaalem@gmail.com" },
 ]
 description = "Downloading and Processing Quran Recitaion of the Holy Quran"
 readme = "README.md"
@@ -18,10 +18,10 @@ dependencies = [
   "pypdl==1.4.4",
   "tqdm",
   "pydantic",
-  "datasets[audio]==4.8.5",
+  "datasets[audio]==5.0.1",
   "pyarrow>=20.0.0",
   "mutagen==1.47.0",
-  "quran-transcript==0.1.2",
+  "quran-transcript==0.6.1",
   "beautifulsoup4==4.12.3",
   "filetype==1.2.0",
   "ruamel.yaml==0.18.6", # It has duplicate key validation in a dict structure
@@ -82,6 +82,10 @@ litert = [
 nemo = [
     "nemo-toolkit[asr]>=2.1.0",
     "pytorch-lightning>=2.6.5",
+]
+ui = [
+    "gradio>=6.20.0",
+    "streamlit>=1.63.0",
 ]
 
 
