@@ -524,7 +524,7 @@ class StreamingDiagnostics:
         print(f"level    : rms {rms:+.1f} dBFS, peak {peak:+.1f} dBFS")
         print(f"browser  : sr {session['native_sr']}, dtypes {session['dtypes']}")
 
-        self._attribute_deficit(session, wall, deficit)
+        self._attribute_deficit(session, wall, captured, deficit)
 
         live_ids = list(session["level_ids"][self.ph])
         replay_text, replay_ratio, replay_ids = self.stream_probe(wav)
@@ -565,12 +565,16 @@ class StreamingDiagnostics:
         return exact and log_ok
 
     @staticmethod
-    def _attribute_deficit(session: dict, wall: float, deficit: float) -> None:
+    def _attribute_deficit(
+        session: dict, wall: float, captured: float, deficit: float
+    ) -> None:
         """Split the wall-clock deficit into warm-up, mid-stream drops and stop latency.
 
         Each arrival ``(t, n)`` means n samples landed at t, so the chunk covers roughly
         ``[t - n/sr, t]``.  Audio can therefore be lost before the first span, between
-        spans, or after the last one.
+        spans, or after the last one — and separately, audio that *did* arrive can fail
+        to reach the model at all, which is a bug rather than a latency cost and is
+        reported on its own line.
         """
         arrivals = session.get("arrivals") or []
         print("\n--- deficit attribution ---")
@@ -582,11 +586,15 @@ class StreamingDiagnostics:
         warmup = max(0.0, ts[0] - ns[0])
         tail = max(0.0, wall - ts[-1])
         drops = max(0.0, (ts[-1] - (ts[0] - ns[0])) - ns.sum())
+        stranded = float(ns.sum()) - captured
         print(f"  chunks received   : {len(arrivals)} ({ns.sum():.1f}s of audio)")
         print(f"  warm-up           : {warmup:5.1f}s  (start_recording -> first audio)")
         print(f"  drops mid-stream  : {drops:5.1f}s  (net gaps between chunks)")
         print(f"  stop latency      : {tail:5.1f}s  (last chunk -> stop handler)")
-        print(f"  accounted         : {warmup + drops + tail:5.1f}s of {deficit:.1f}s")
+        if abs(stranded) > 0.05:
+            print(f"  stranded          : {stranded:5.1f}s  (ARRIVED BUT NEVER FED — a bug)")
+        print(f"  accounted         : {warmup + drops + tail + stranded:5.1f}s "
+              f"of {deficit:.1f}s")
         if len(ts) > 1:
             # Individual gaps measure arrival jitter, not loss: a late chunk is followed
             # by one carrying the backlog, so only the net above is lost audio.
@@ -745,7 +753,7 @@ def build_demo(
         state.update(
             streamer=FastConformerMicStreamer(model, vocab, device),
             resampler=None, native_sr=None, resampler_closed=False, delivered_sr=None,
-            pending=[], arrivals=[], log=[], errors=[], dtypes=set(),
+            pending=[], arrivals=[], log=[], errors=[], dtypes=set(), stopping=False,
             t0=time.perf_counter(), status=status, capture=None,
         )
 
@@ -848,8 +856,11 @@ def build_demo(
         """Ingestion only — no model call, no render.  See build_demo's docstring."""
         try:
             st = state["streamer"]
-            # Checked before the resampler is touched: queued events arrive after stop.
-            if st.finished or audio_chunk is None:
+            # `stopping` closes the window between on_stop's drain and flush; without
+            # it a chunk landing in that gap is never fed and vanishes from the capture.
+            # `finished` is checked before the resampler is touched, because queued
+            # events keep arriving after stop_recording.
+            if state.get("stopping") or st.finished or audio_chunk is None:
                 return
             sr, y = audio_chunk
             state["delivered_sr"] = sr
@@ -875,6 +886,7 @@ def build_demo(
         st = state["streamer"]
         if st.finished:
             return _render()
+        state["stopping"] = True  # no further appends; everything pending is now ours
         if state["resampler"] is not None and not state["resampler_closed"]:
             tail = _resample(state["native_sr"], np.zeros(0, dtype=np.float32), last=True)
             if len(tail):

@@ -44,6 +44,10 @@ testpaths = [
   "tests/test_ctc_decoding.py",
   "tests/test_streaming_processor.py",
 ]
+# The package cannot be pip-installed where python < 3.14 (see requires-python), so
+# pytest would not find `prepare_quran_dataset` at all. "." also puts train_streaming
+# in reach, which un-skips the canonical-decoder comparison.
+pythonpath = ["src", "."]
 
 [project.optional-dependencies]
 
