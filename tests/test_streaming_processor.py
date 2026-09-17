@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 
 from prepare_quran_dataset.modeling_fastconformer_cache_aware.processor import (
@@ -69,20 +68,27 @@ class StreamingProcessorMath:
         return self.window - self.hop
 
     def _calc_drop_start(self) -> int:
-        """Number of frames to deop from the begining of each processed chunk"""
+        """Number of frames to drop from the beginning of each processed chunk"""
         return (self.front_pad + self.window // 2) // self.hop
 
     def _calc_drop_end(self) -> int:
-        """Number of frames to deop from the begining of each processed chunk"""
+        """Number of frames to drop from the end of each processed chunk"""
         return self.window // (self.hop * 2)
 
     def calc_chunk_from_frames(self, frames: int) -> int:
-        """calculating chunks lenght in samples given the chunk in frames"""
-        return (
-            self.hop * (frames + self.drop_start + self.drop_end)
-            - self.front_pad
-            + self.window // 2
-        )
+        """Chunk length in samples that nets exactly `frames` usable mel frames.
+
+        Two invariants pin the formula (both asserted by the notebook):
+
+        1. `calc_samples_to_frames(front_pad + chunk) - drop_start - drop_end == frames`
+        2. `chunk - overlap == hop * frames`, so consecutive chunks advance by
+           exactly `frames` frames and the stream neither gaps nor overlaps.
+
+        Only `drop_end` enters the expression: `drop_start` is already paid for
+        by `front_pad`, which exists to make `front_pad + window // 2` a whole
+        number of hops. Including it again overshoots by `drop_start` frames.
+        """
+        return self.hop * (frames + self.drop_end) - self.front_pad + self.window // 2
 
 
 def run_offline_processor(
@@ -164,17 +170,28 @@ def make_processor() -> FastConformerMelProcessor:
     NeMo adds random noise (dither) per call while the module is in train mode,
     which makes offline vs streaming outputs differ by ~1e-4 everywhere.
     """
-    # NOTE: we set dither to 0.0 for sake of coparing the two processor but leave as the default for actual run
-    return FastConformerMelProcessor(dither=0.0, rng=np.random.default_rng(10))
+    # NOTE: we set dither to 0.0 for sake of comparing the two processors but leave as the default for actual run
+    return FastConformerMelProcessor(dither=0.0)
 
 
 if __name__ == "__main__":
     processor = make_processor()
     wave = torch.randn(1, 320000)
     sp = StreamingProcessorMath()
-    print(f"drops: {sp.drop_start, sp.drop_end}")
+    print(f"overlap: {sp.overlap}, drops: {sp.drop_start, sp.drop_end}")
+
+    frames_per_chunk = 4
+    chunk = sp.calc_chunk_from_frames(frames_per_chunk)
+    assert (
+        sp.calc_samples_to_frames(sp.front_pad + chunk) - sp.drop_start - sp.drop_end
+        == frames_per_chunk
+    ), "calc_chunk_from_frames does not net the requested frame count"
+    assert chunk - sp.overlap == sp.hop * frames_per_chunk, (
+        "chunk stride must advance by exactly `frames` mel frames"
+    )
+    print(f"chunk: {chunk} samples ({chunk / 16:.1f} ms) -> {frames_per_chunk} frames")
+
     offline_feats, offline_windows = run_offline_processor(sp, wave, processor)
-    chunk = sp.calc_chunk_from_frames(4 * 1)
     streaming_feats, streaming_windows = run_streaming_processor(
         sp,
         wave,
@@ -182,17 +199,18 @@ if __name__ == "__main__":
         chunk=chunk,
     )
     print(f"offline sample windows: {offline_windows.shape}")
-    print(f"offline sample windows: {streaming_windows.shape}")
-    margin = 2001
+    print(f"streaming sample windows: {streaming_windows.shape}")
+
+    # Compare over the frames both paths produced; the tail chunk can differ.
+    margin = min(offline_feats.shape[2], streaming_feats.shape[2])
+    off, stream = offline_feats[:, :, :margin], streaming_feats[:, :, :margin]
     print(
-        f"Both Samples windows match: {torch.allclose(offline_windows[:, 56:456, :margin], streaming_windows[:, 56:456, :margin])}"
+        f"Both sample windows match: "
+        f"{torch.allclose(offline_windows[:, 56:456, :margin], streaming_windows[:, 56:456, :margin])}"
     )
     print(f"Offline Len: {offline_feats.shape}")
     print(f"Streaming Len: {streaming_feats.shape}")
-    print(f" Num of chunk frames: {sp.calc_samples_to_frames(sp.front_pad + chunk)}")
-    print(
-        f"Both processor are {torch.allclose(offline_feats[:, :, :margin], streaming_feats[:, :, :margin], atol=1e-6)}"
-    )
-    print(
-        f"Both processor are {torch.allclose(offline_feats[:, :, :margin], streaming_feats[:, :, :margin])}"
-    )
+    print(f"Num of chunk frames: {sp.calc_samples_to_frames(sp.front_pad + chunk)}")
+    print(f"max |offline - streaming|: {(off - stream).abs().max().item():.3e}")
+    print(f"Both processors match (atol=1e-6): {torch.allclose(off, stream, atol=1e-6)}")
+    print(f"Both processors match (default tol): {torch.allclose(off, stream)}")
