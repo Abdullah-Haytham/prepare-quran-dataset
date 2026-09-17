@@ -1,3 +1,14 @@
+try:
+    import pytest
+except ImportError:  # running as a plain script
+    pytest = None
+else:
+    # Skip rather than error at collection: this module needs the GPU stack, even
+    # though test_chunk_from_frames_invariants below is pure arithmetic. Moving
+    # StreamingProcessorMath beside prepare_quran_dataset.ctc_decoding would free it.
+    pytest.importorskip("torch")
+    pytest.importorskip("nemo")
+
 import torch
 
 from prepare_quran_dataset.modeling_fastconformer_cache_aware.processor import (
@@ -174,7 +185,33 @@ def make_processor() -> FastConformerMelProcessor:
     return FastConformerMelProcessor(dither=0.0)
 
 
+def test_chunk_from_frames_invariants():
+    """The two properties `calc_chunk_from_frames` must satisfy.
+
+    Kept out of `__main__` so pytest actually runs them: the original asserts lived
+    only in the script body, where a wrong formula stayed invisible because the
+    offline/streaming comparison is self-consistent either way.
+
+    Pure arithmetic — no processor, no model — so this runs without nemo.
+    """
+    sp = StreamingProcessorMath()
+    assert (sp.overlap, sp.drop_start, sp.drop_end) == (240, 2, 1)
+    for frames in (1, 4, 13, 52):
+        chunk = sp.calc_chunk_from_frames(frames)
+        sp.check_chunk_size(chunk)
+        net = (
+            sp.calc_samples_to_frames(sp.front_pad + chunk)
+            - sp.drop_start
+            - sp.drop_end
+        )
+        assert net == frames, f"{frames} frames -> chunk {chunk} nets {net}"
+        assert chunk - sp.overlap == sp.hop * frames, (
+            f"stride {chunk - sp.overlap} != hop * {frames}"
+        )
+
+
 if __name__ == "__main__":
+    test_chunk_from_frames_invariants()
     processor = make_processor()
     wave = torch.randn(1, 320000)
     sp = StreamingProcessorMath()
@@ -182,13 +219,6 @@ if __name__ == "__main__":
 
     frames_per_chunk = 4
     chunk = sp.calc_chunk_from_frames(frames_per_chunk)
-    assert (
-        sp.calc_samples_to_frames(sp.front_pad + chunk) - sp.drop_start - sp.drop_end
-        == frames_per_chunk
-    ), "calc_chunk_from_frames does not net the requested frame count"
-    assert chunk - sp.overlap == sp.hop * frames_per_chunk, (
-        "chunk stride must advance by exactly `frames` mel frames"
-    )
     print(f"chunk: {chunk} samples ({chunk / 16:.1f} ms) -> {frames_per_chunk} frames")
 
     offline_feats, offline_windows = run_offline_processor(sp, wave, processor)
