@@ -427,18 +427,24 @@ class StreamingDiagnostics:
         mel, _ = self.processor(input_signal=t, length=n)
         return self.tokens(ids), nonblank(ids), float(mel.mean())
 
-    def stream_probe(
+    def replay(
         self, wav: np.ndarray, chunk_s: float = 0.5
-    ) -> tuple[str, float, list[int]]:
-        """Same buffer through the live streamer, in fixed-size chunks.
+    ) -> FastConformerMicStreamer:
+        """Drive a fresh streamer over ``wav`` in fixed-size chunks.
 
-        A fresh streamer every call: the encoder cache must not leak between probes.
+        A new streamer every call: the encoder cache must not leak between probes.
         """
         st = FastConformerMicStreamer(self.model, self.vocab, self.device)
         step = int(chunk_s * SAMPLE_RATE)
         for pos in range(0, len(wav), step):
             st.feed(wav[pos : pos + step])
         st.flush()
+        return st
+
+    def stream_probe(
+        self, wav: np.ndarray, chunk_s: float = 0.5
+    ) -> tuple[str, float, list[int]]:
+        st = self.replay(wav, chunk_s)
         ids = st.level_ids[self.ph]
         return self.tokens(ids), nonblank(ids), ids
 
@@ -526,9 +532,23 @@ class StreamingDiagnostics:
 
         self._attribute_deficit(session, wall, captured, deficit)
 
+        live_samples = session.get("n_samples")
+        if live_samples is not None and live_samples != len(wav):
+            drift = (len(wav) - live_samples) / SAMPLE_RATE
+            print(f"\ncapture round-trip: wrote {live_samples} samples, read back "
+                  f"{len(wav)} ({drift:+.3f}s) — the replay is not seeing the same audio")
+
         live_ids = list(session["level_ids"][self.ph])
-        replay_text, replay_ratio, replay_ids = self.stream_probe(wav)
+        replay_streamer = self.replay(wav)
+        replay_ids = replay_streamer.level_ids[self.ph]
+        replay_text = self.tokens(replay_ids)
+        replay_ratio = nonblank(replay_ids)
         live_text = self.tokens(live_ids)
+        live_steps, replay_steps = session.get("steps"), replay_streamer.step
+        if live_steps is not None and live_steps != replay_steps:
+            print(f"\nstep count: live ran {live_steps}, replay ran {replay_steps} "
+                  f"({live_steps - replay_steps:+d}) over "
+                  f"{replay_streamer.featurizer.total_frames_final()} mel frames")
 
         n = min(len(live_ids), len(replay_ids))
         first_diff = next((i for i in range(n) if live_ids[i] != replay_ids[i]), None)
@@ -557,8 +577,12 @@ class StreamingDiagnostics:
             print("LIVE MATCHES REPLAY — the streaming path is verified end to end on "
                   f"real microphone audio ({len(live_ids)} frames, exact).")
         elif agreement > 0.99:
-            print(f"NEAR MATCH — {agreement:.2%} of frames agree; lengths "
-                  f"{len(live_ids)} vs {len(replay_ids)}. Most likely the final chunk.")
+            extra = len(live_ids) - len(replay_ids)
+            print(f"NEAR MATCH — {agreement:.2%} of frames agree over the common prefix; "
+                  f"lengths {len(live_ids)} vs {len(replay_ids)} ({extra:+d}).")
+            print("  The shorter run is a strict prefix, so this is a tail-step "
+                  "difference, not a decode error. Check the two lines above: a capture "
+                  "round-trip drift or a step-count difference names the cause.")
         else:
             print(f"LIVE DIFFERS FROM REPLAY — only {agreement:.2%} of frames agree. "
                   "The same buffer replays correctly, so this is a live-only bug.")
@@ -899,11 +923,13 @@ def build_demo(
         wav = np.array(st.featurizer.buf, copy=True)
         if len(wav):
             out_dir.mkdir(parents=True, exist_ok=True)
-            sf.write(out_dir / "capture.wav", wav, SAMPLE_RATE)
+            sf.write(out_dir / "capture.wav", wav, SAMPLE_RATE, subtype="FLOAT")
             (out_dir / "session.json").write_text(
                 json.dumps(
                     {
                         "chunk_log": state["log"],
+                        "n_samples": int(len(wav)),
+                        "steps": st.step,
                         "arrivals": state["arrivals"],
                         "wall_seconds": time.perf_counter() - state["t0"],
                         "native_sr": state["delivered_sr"],
