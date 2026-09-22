@@ -115,25 +115,54 @@ def test_single_frame_chunks_are_the_worst_case():
         assert carried == ctc_collapse(ids), ids
 
 
-def test_matches_canonical_ctc_decode():
-    """Guard against drift from ``train_streaming.ctc_decode``, the repo's decoder.
+def _load_canonical_ctc_decode():
+    """Lift ``ctc_decode`` out of train_streaming.py without importing the module.
 
-    Skipped where the heavy stack is absent — train_streaming imports torch, jax and
-    datasets — rather than duplicating the canonical algorithm into this file, which
-    would defeat the point of comparing against it.
+    The obvious ``from train_streaming import ctc_decode`` skips everywhere — even on
+    Colab — because that module imports Levenshtein, datasets and jax at the top.  The
+    function itself is self-contained numpy, so extracting its AST keeps this a real
+    drift guard instead of a permanently-skipped test.
+    """
+    import ast
+    from pathlib import Path
+
+    import numpy as np
+    from numpy.typing import NDArray
+
+    path = Path(__file__).resolve().parents[1] / "train_streaming.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    fn = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "ctc_decode"),
+        None,
+    )
+    if fn is None:
+        return None
+    # `ctc_decode` annotates its return as list[NDArray], evaluated at def time.
+    namespace = {"np": np, "NDArray": NDArray}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["ctc_decode"]
+
+
+def test_matches_canonical_ctc_decode():
+    """``ctc_collapse`` must stay equivalent to the repo's canonical decoder.
+
+    Equivalence holds only once specials are stripped, which every ctc_decode caller
+    does immediately afterwards — that composition is the contract being pinned.
     """
     try:
         import numpy as np
-
-        from train_streaming import ctc_decode
-    except Exception as exc:
-        _skip(f"train_streaming unavailable ({type(exc).__name__}); canonical check skipped")
+    except ImportError:
+        _skip("numpy unavailable")
+        return
+    canonical_fn = _load_canonical_ctc_decode()
+    if canonical_fn is None:
+        _skip("ctc_decode not found in train_streaming.py")
         return
 
     rng = random.Random(2)
     for _ in range(2_000):
         ids = [rng.choice(FUZZ_ALPHABET) for _ in range(rng.randint(1, 60))]
-        canonical = ctc_decode([np.array(ids, dtype=np.int64)], blank_id=BLANK_ID)[0]
+        canonical = canonical_fn([np.array(ids, dtype=np.int64)], blank_id=BLANK_ID)[0]
         expected = [int(t) for t in canonical if int(t) not in (BLANK_ID, EOS_ID)]
         assert ctc_collapse(ids) == expected, ids
 
