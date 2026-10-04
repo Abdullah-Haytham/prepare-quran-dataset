@@ -61,9 +61,10 @@ learning_rate: 5e-5
 seed: 42
 
 # Batch sizes
-# L4 (24 GB): 16 x 20s clips should fit without gradient checkpointing (w2v-bert attention
-# is eager with relative positions, so memory grows with batch * seq_len^2).
-# If GPU memory stays < ~60% in the first steps, try 24.
+# L4 (22 GB usable): w2v-bert attention is eager with relative positions, so each layer
+# keeps batch x heads x T x T scores (T ~ 1000 frames for 20 s). Without gradient
+# checkpointing batch 16 runs out of memory; with it, only one layer's activations live
+# at a time. If memory stays < ~60% on long batches, try 24-32.
 per_device_train_batch_size: 16
 pre_device_eval_batch_size: 16
 
@@ -107,7 +108,7 @@ processor_name_or_path: "./w2v2bert-384"  # SeamlessM4TFeatureExtractor
 ignore_mismatched_sizes: false
 
 # Gradint checkpointing
-gradient_checkpoiniting: false  # ~30% faster; enable if you raise the batch size and run out of memory
+gradient_checkpoiniting: true  # required on L4: batch 16 without it runs out of memory
 
 # Output directory for checkpoints
 output_dir: "./results-w2v2bert-384"

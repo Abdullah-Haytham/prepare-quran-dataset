@@ -21,6 +21,8 @@ EXTRA_ARGS=("$@")
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1
+# batches have variable lengths: avoid allocator fragmentation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 LOG_DIR="${LOG_DIR:-./logs}"
 mkdir -p "$LOG_DIR"
