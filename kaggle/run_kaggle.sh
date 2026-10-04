@@ -33,7 +33,29 @@ export HF_HOME="${HF_HOME:-/tmp/hf}"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1
 
-NUM_GPUS="$(python -c 'import torch; print(torch.cuda.device_count())')"
-echo "Launching on ${NUM_GPUS} GPU(s) with config: ${CONFIG}"
+export PYTHONUNBUFFERED=1
 
-torchrun --standalone --nproc_per_node="${NUM_GPUS}" train.py --config "${CONFIG}" "$@"
+# Logs live in /kaggle/working so they survive a crashed session
+LOG_DIR="${LOG_DIR:-/kaggle/working/logs}"
+mkdir -p "$LOG_DIR"
+echo "Logs: $LOG_DIR/train.log, resource usage: $LOG_DIR/resources.log"
+
+# Record RAM / disk / GPU memory every minute to diagnose OOM or full-disk crashes
+(
+  while true; do
+    echo "===== $(date '+%F %T')"
+    free -m
+    df -h /kaggle/working /tmp 2>/dev/null
+    du -sh "$HF_HOME" 2>/dev/null
+    nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader
+    sleep 60
+  done
+) >> "$LOG_DIR/resources.log" 2>&1 &
+MONITOR_PID=$!
+trap 'kill $MONITOR_PID 2>/dev/null' EXIT
+
+NUM_GPUS="$(python -c 'import torch; print(torch.cuda.device_count())')"
+echo "Launching on ${NUM_GPUS} GPU(s) with config: ${CONFIG}" | tee -a "$LOG_DIR/train.log"
+
+torchrun --standalone --nproc_per_node="${NUM_GPUS}" train.py --config "${CONFIG}" "$@" \
+  2>&1 | tee -a "$LOG_DIR/train.log"
