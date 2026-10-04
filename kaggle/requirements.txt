@@ -1,5 +1,5 @@
-transformers>=5.9.0
-accelerate>=1.13
+transformers==5.9.0
+accelerate==1.13.0
 datasets[audio]==4.8.5
 quran-transcript==0.1.2
 qdat-bench @ git+https://github.com/obadx/qdat_bench.git@e8aa630fc988a4eade0225fb965d05f955ecdf86
