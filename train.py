@@ -64,6 +64,9 @@ from qdat_bench.audio_utils import decode_audio
 from qdat_bench.eval_results import eval_qdat_bench
 from huggingface_hub import HfApi
 from tqdm import tqdm
+from accelerate import PartialState
+
+from gdrive_download import download_gdrive_files, maybe_download_config
 
 
 # TODO:
@@ -111,6 +114,11 @@ class TrainConfig(BaseModel):
     base_model_name_or_path: str = "facebook/w2v-bert-2.0"
     processor_name_or_path: str = "facebook/w2v-bert-2.0"
     ignore_mismatched_sizes: bool = True
+    # T4 / older GPUs do not support bf16 -> use fp16
+    mixed_precision: Literal["bf16", "fp16", "no"] = "bf16"
+    ddp_find_unused_parameters: bool = False
+    # {target_dir: {filename: google_drive_link}} downloaded before training
+    gdrive_files: dict[str, dict[str, str]] | None = None
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "TrainConfig":
@@ -720,9 +728,12 @@ def run_qdat_bench_test(
     with torch.no_grad():
         for batch in tqdm(dataloader):
             ids = batch.pop("id")
-            batch = {k: v.to(device, dtype=dtype) for k, v in batch.items()}
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-            outputs = model(**batch)
+            with torch.autocast(
+                device_type=device.type, dtype=dtype, enabled=dtype != torch.float32
+            ):
+                outputs = model(**batch)
             level_to_logits = outputs[0]
 
             level_to_labels = {}
@@ -811,7 +822,13 @@ if __name__ == "__main__":
     # loading wandb tokens ans HF login
     load_secrets()
     register_model()
-    train_config = TrainConfig.from_yaml(args.config)
+
+    # Download config and model files (Google Drive) on the local main process only
+    state = PartialState()
+    with state.local_main_process_first():
+        args.config = maybe_download_config(args.config)
+        train_config = TrainConfig.from_yaml(args.config)
+        download_gdrive_files(train_config.gdrive_files)
     print(train_config)
     multi_level_tokenizer = MultiLevelTokenizer("./")
 
@@ -846,8 +863,9 @@ if __name__ == "__main__":
         ex["id"]: MoshafAttributes(**ex) for ex in moshaf_dataeet
     }
 
-    processor.push_to_hub(train_config.hub_model_id)
-    multi_level_tokenizer.get_tokenizer().push_to_hub(train_config.hub_model_id)
+    if state.is_main_process:
+        processor.push_to_hub(train_config.hub_model_id)
+        multi_level_tokenizer.get_tokenizer().push_to_hub(train_config.hub_model_id)
 
     # Initializaze wanddb
     # set the wandb project where this run will be logged
@@ -858,10 +876,6 @@ if __name__ == "__main__":
 
     # turn off watch to log faster
     os.environ["WANDB_WATCH"] = "false"
-
-    # Load dataset
-    # Update with your dataset path
-    dataset = prepare_dataset(train_config, processor, multi_level_tokenizer)
 
     # Configure training arguments
     training_args = TrainingArguments(
@@ -885,18 +899,27 @@ if __name__ == "__main__":
         greater_is_better=train_config.greater_is_better,
         # push_to_hub=True,  # this pushed every checkpoint to the hup we want to push the best model only
         hub_model_id=train_config.hub_model_id,  # Update with your model name
-        bf16=True,
+        bf16=train_config.mixed_precision == "bf16",
+        fp16=train_config.mixed_precision == "fp16",
+        ddp_find_unused_parameters=train_config.ddp_find_unused_parameters,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=train_config.num_workers > 0,
         warmup_ratio=train_config.warmup_ratio,
         optim="adamw_torch",
         lr_scheduler_type="constant",
         report_to=["tensorboard", "wandb"],
         gradient_checkpointing=train_config.gradient_checkpoiniting,  # Optional for memory savings
+        gradient_checkpointing_kwargs={"use_reentrant": False},  # required for DDP
         save_total_limit=3,
         hub_strategy="all_checkpoints",  # pushes all checkpoints to the Hub with one checkpoint per subfolder in your model repository
         remove_unused_columns=False,
         eval_accumulation_steps=128,  # offload eval logits to CPU each step to prevent GPU OOM from accumulated predictions
     )
     print(training_args)
+
+    # Load dataset (main process first so other ranks reuse the datasets cache)
+    with training_args.main_process_first(desc="prepare train dataset"):
+        dataset = prepare_dataset(train_config, processor, multi_level_tokenizer)
 
     # Initialize label processor
     data_collector = DataCollatorCTCWithPadding(
@@ -933,21 +956,30 @@ if __name__ == "__main__":
                 f"Found existing {test_results_path}, skipping test evaluation. Use --rerun-testset to force."
             )
         else:
-            testset = prepare_dataset(
-                train_config, processor, multi_level_tokenizer, is_testset=True
-            )
+            with training_args.main_process_first(desc="prepare test dataset"):
+                testset = prepare_dataset(
+                    train_config, processor, multi_level_tokenizer, is_testset=True
+                )
+            # evaluate is collective: must run on all ranks
             test_results = trainer.evaluate(testset["test"], metric_key_prefix="test_")
-            with open(test_results_path, "w") as f:
-                json.dump(test_results, f, indent=4)
-            print("Test Results:", test_results)
+            if trainer.is_world_process_zero():
+                with open(test_results_path, "w") as f:
+                    json.dump(test_results, f, indent=4)
+                print("Test Results:", test_results)
 
     # QDAT benchmark evaluation
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16
+    device = trainer.args.device
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "no": torch.float32,
+    }[train_config.mixed_precision]
     qdat_pred_path = Path(train_config.output_dir) / "qdat_bench_predictions.jsonl"
     qdat_results_path = Path(train_config.output_dir) / "qdat_bench_test_results.json"
 
-    if qdat_results_path.exists() and not args.rerun_qdat_bench:
+    if not trainer.is_world_process_zero():
+        pass  # qdat_bench runs on the main process only
+    elif qdat_results_path.exists() and not args.rerun_qdat_bench:
         print(
             f"Found existing {qdat_results_path}, skipping qdat_bench. Use --rerun-qdat-bench to force."
         )
@@ -985,7 +1017,7 @@ if __name__ == "__main__":
         api = HfApi()
         for fname in ["test_results.json", "qdat_bench_test_results.json"]:
             fpath = Path(train_config.output_dir) / fname
-            if fpath.exists():
+            if trainer.is_world_process_zero() and fpath.exists():
                 api.upload_file(
                     path_or_fileobj=str(fpath),
                     path_in_repo=fname,
