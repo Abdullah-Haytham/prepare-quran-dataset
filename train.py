@@ -496,6 +496,23 @@ def register_model():
     )
 
 
+def load_backbone_checked(model_cls, path: str, max_missing_ratio=0.5, **kwargs):
+    """`from_pretrained` that fails when most backbone weights are missing
+    (e.g. a w2v-bert checkpoint loaded into a w2v2 model) instead of silently
+    training from random init."""
+    model, info = model_cls.from_pretrained(path, output_loading_info=True, **kwargs)
+    backbone_keys = [k for k in model.state_dict() if "lm_head" not in k]
+    missing = [k for k in info["missing_keys"] if "lm_head" not in k]
+    if backbone_keys and len(missing) / len(backbone_keys) > max_missing_ratio:
+        raise ValueError(
+            f"{len(missing)}/{len(backbone_keys)} backbone weights are missing from `{path}` "
+            f"for `{model_cls.__name__}`. The checkpoint does not match the selected "
+            f"`architecture`. Example missing keys: {missing[:5]}, "
+            f"unexpected keys: {info['unexpected_keys'][:5]}"
+        )
+    return model
+
+
 def build_model_components(
     train_config: TrainConfig,
     level_to_vocab_size: dict[str, int],
@@ -527,14 +544,16 @@ def build_model_components(
 
     if train_config.architecture == "w2v2bert":
         config = Wav2Vec2BertForMultilevelCTCConfig(**common_config_kwargs)
-        model = Wav2Vec2BertForMultilevelCTC.from_pretrained(
+        model = load_backbone_checked(
+            Wav2Vec2BertForMultilevelCTC,
             train_config.base_model_name_or_path,
             config=config,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
         )
     elif train_config.architecture == "w2v2":
         config = Wav2Vec2ForMultilevelCTCConfig(**common_config_kwargs)
-        model = Wav2Vec2ForMultilevelCTC.from_pretrained(
+        model = load_backbone_checked(
+            Wav2Vec2ForMultilevelCTC,
             train_config.base_model_name_or_path,
             config=config,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
@@ -555,7 +574,8 @@ def build_model_components(
             ctc_loss_reduction="mean",
         )
         config = WhisperEncoderForMultilevelCTCConfig(**whisper_kwargs)
-        model = WhisperEncoderForMultilevelCTC.from_pretrained(
+        model = load_backbone_checked(
+            WhisperEncoderForMultilevelCTC,
             train_config.base_model_name_or_path,
             config=config,
             ignore_mismatched_sizes=ignore_mismatched_sizes,

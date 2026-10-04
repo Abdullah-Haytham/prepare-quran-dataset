@@ -87,7 +87,7 @@ hub_model_id: "obadx/muaalem-model-w2v2-384"
 wandb_project_name: "muaalem-model-w2v2-384"
 
 # Architecture selection: w2v2bert (Wav2Vec2Bert) or w2v2 (Wav2Vec2)
-architecture: w2v2
+architecture: w2v2bert  # pruned from obadx/muaalem-model-v3_2 (wav2vec2-bert)
 
 # Base model weights ID or path (backbone)
 base_model_name_or_path: "./w2v2-384"
