@@ -83,6 +83,9 @@ logging_steps: 50
 num_workers: null
 
 mixed_precision: bf16
+# bf16 has no GradScaler: drop infinite CTC losses (targets longer than the output
+# frames) instead of letting them NaN the weights (train.py also skips non-finite steps)
+ctc_zero_infinity: true
 
 # Optimizer settings
 weight_decay: 0.00

@@ -136,6 +136,9 @@ class TrainConfig(BaseModel):
     # "epoch": eval/save every epoch and keep a copy of each epoch's model in <output_dir>/epoch-NN
     save_strategy: Literal["steps", "epoch"] = "steps"
     logging_steps: int = 50  # only used with save_strategy: epoch
+    # zero out infinite CTC losses (targets longer than the output frames) instead of
+    # letting them turn the gradients into NaN
+    ctc_zero_infinity: bool = False
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "TrainConfig":
@@ -426,6 +429,30 @@ class EpochSnapshotCallback(TrainerCallback):
             print(f"Uploaded {epoch_dir.name} to {self.hub_model_id}")
 
 
+class SkipNonFiniteGradCallback(TrainerCallback):
+    """bf16/fp32 have no GradScaler, so one bad batch (e.g. an infinite CTC loss) would
+    write NaN into the weights. Like fp16's GradScaler, skip the optimizer step when any
+    gradient is not finite (AdamW skips parameters whose grad is None)."""
+
+    def __init__(self):
+        self.skipped = 0
+
+    def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return
+        total = torch.stack(torch._foreach_norm(grads)).sum()
+        if not torch.isfinite(total):
+            for p in model.parameters():
+                p.grad = None
+            self.skipped += 1
+            if state.is_world_process_zero:
+                print(
+                    f"[step {state.global_step}] non-finite gradients, skipped optimizer step "
+                    f"({self.skipped} skipped so far)"
+                )
+
+
 class Augment(object):
     def __init__(
         self,
@@ -634,6 +661,7 @@ def build_model_components(
         mask_time_prob=0.0,
         layerdrop=0.0,
         ctc_loss_reduction="mean",
+        ctc_zero_infinity=train_config.ctc_zero_infinity,
         add_adapter=False,
         adapter_stride=1,
     )
@@ -668,6 +696,7 @@ def build_model_components(
             mask_time_prob=0.0,
             encoder_layerdrop=0.0,
             ctc_loss_reduction="mean",
+            ctc_zero_infinity=train_config.ctc_zero_infinity,
         )
         config = WhisperEncoderForMultilevelCTCConfig(**whisper_kwargs)
         model = load_backbone_checked(
@@ -1157,6 +1186,8 @@ if __name__ == "__main__":
         compute_metrics=compute_metrics,
         data_collator=data_collector,
     )
+    if train_config.mixed_precision != "fp16":  # fp16 already skips via GradScaler
+        trainer.add_callback(SkipNonFiniteGradCallback())
     if train_config.save_strategy == "epoch" and session_idx is None:
         trainer.add_callback(
             EpochSnapshotCallback(
