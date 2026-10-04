@@ -48,14 +48,14 @@ max_audio_seconds: 20.0
 dropout: 0.0
 
 # Model architecture (defaults match w2v-bert-2.0)
-num_hidden_layers: 24
+num_hidden_layers: 16
 hidden_size: 384
 output_hidden_size: 384
 intermediate_size: 1536
 num_attention_heads: 6
 
 # Training parameters
-num_epochs: 3
+num_epochs: 10
 learning_rate: 5e-5
 seed: 42
 
