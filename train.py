@@ -3,6 +3,9 @@
 from pathlib import Path
 import json
 import os
+import math
+import shutil
+from datetime import timedelta
 import yaml
 import random
 from typing import List, Union, Dict, Literal
@@ -30,6 +33,7 @@ from numpy.typing import NDArray
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from torch.utils.data import default_collate
 import torch
+import torch.distributed as dist
 from torch.nn import CrossEntropyLoss
 from pydantic import BaseModel, field_validator, model_validator
 
@@ -65,6 +69,8 @@ from qdat_bench.eval_results import eval_qdat_bench
 from huggingface_hub import HfApi
 from tqdm import tqdm
 from accelerate import PartialState
+from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_callback import TrainerState
 
 from gdrive_download import download_gdrive_files, maybe_download_config
 
@@ -119,6 +125,12 @@ class TrainConfig(BaseModel):
     ddp_find_unused_parameters: bool = False
     # {target_dir: {filename: google_drive_link}} downloaded before training
     gdrive_files: dict[str, dict[str, str]] | None = None
+    # processes for dataset download/filtering (defaults to num_workers)
+    data_num_proc: int | None = None
+    # Disk-limited machines (e.g. Kaggle): each run trains on one group of moshafs
+    # (overriding `train_moshaf_ids`) and resumes from the previous run's checkpoint.
+    # Total runs = len(train_moshaf_groups) * num_epochs; each run is one epoch over its group.
+    train_moshaf_groups: list[list[str]] | None = None
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "TrainConfig":
@@ -175,6 +187,8 @@ class TrainConfig(BaseModel):
             self.num_workers = min(
                 os.cpu_count() or 1, self.per_device_train_batch_size
             )
+        if self.data_num_proc is None:
+            self.data_num_proc = self.num_workers
         return self
 
 
@@ -406,6 +420,34 @@ class Augment(object):
         return item
 
 
+TRAIN_DATASET_ID = "obadx/muaalem-annotated-v3"
+
+
+def free_dataset_download_cache(dataset_id: str = TRAIN_DATASET_ID):
+    """Delete the downloaded parquet files of `dataset_id` from the HF hub cache.
+    The prepared arrow files (datasets cache) are kept and are all training needs."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    path = Path(HF_HUB_CACHE) / f"datasets--{dataset_id.replace('/', '--')}"
+    if path.exists():
+        shutil.rmtree(path)
+        print(f"Deleted download cache: {path}")
+
+
+ROTATION_STATE_FILE = "rotation_state.json"
+
+
+def get_rotation_session(train_config: TrainConfig) -> tuple[int, int]:
+    """Returns (index of the current run, total number of runs) for group rotation."""
+    state_path = Path(train_config.output_dir) / ROTATION_STATE_FILE
+    session_idx = 0
+    if state_path.exists():
+        with open(state_path) as f:
+            session_idx = json.load(f)["next_session"]
+    total = len(train_config.train_moshaf_groups) * train_config.num_epochs
+    return session_idx, total
+
+
 def prepare_dataset(
     train_config: TrainConfig,
     processor,
@@ -421,10 +463,10 @@ def prepare_dataset(
     ds = concatenate_datasets(
         [
             load_dataset(
-                "obadx/muaalem-annotated-v3",
+                TRAIN_DATASET_ID,
                 name=f"moshaf_{m_id}",
                 split="train",
-                num_proc=train_config.num_workers,
+                num_proc=train_config.data_num_proc,
             )
             for m_id in moshaf_ids
         ]
@@ -441,10 +483,18 @@ def prepare_dataset(
         wav, _ = librosa.load(src, sr=16000, mono=True)
         return len(wav)
 
-    ds = ds.filter(
-        lambda ex: _audio_len(ex["audio"]) <= max_samples,
-        num_proc=train_config.num_workers,
-    )
+    if "duration_seconds" in ds.column_names:
+        # use the stored duration instead of decoding every audio file
+        ds = ds.filter(
+            lambda d: d <= train_config.max_audio_seconds,
+            input_columns="duration_seconds",
+            num_proc=train_config.data_num_proc,
+        )
+    else:
+        ds = ds.filter(
+            lambda ex: _audio_len(ex["audio"]) <= max_samples,
+            num_proc=train_config.data_num_proc,
+        )
 
     # # Add augmentations
     # if not is_testset:
@@ -837,11 +887,33 @@ if __name__ == "__main__":
         action="store_true",
         help="Force re-run qdat_bench inference + evaluation even if results exist",
     )
+    parser.add_argument(
+        "--prepare-data-only",
+        action="store_true",
+        help="Download the model files and build the datasets cache, then exit (run before torchrun)",
+    )
+    parser.add_argument(
+        "--free-download-cache",
+        action="store_true",
+        help="With --prepare-data-only: delete the downloaded parquet files after preparing (saves disk)",
+    )
+    parser.add_argument(
+        "--rotation-remaining",
+        action="store_true",
+        help="Print `REMAINING=<n>` rotation runs left (-1 without train_moshaf_groups) and exit",
+    )
     args = parser.parse_args()
 
     # loading wandb tokens ans HF login
     load_secrets()
     register_model()
+
+    # Init the process group ourselves: the default NCCL timeout (10 min) is shorter
+    # than the main-process-only steps (e.g. dataset filtering) the other ranks wait for
+    ddp_timeout = int(os.environ.get("DDP_TIMEOUT", 6 * 3600))
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1 and not dist.is_initialized():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        dist.init_process_group(backend="nccl", timeout=timedelta(seconds=ddp_timeout))
 
     # Download config and model files (Google Drive) on the local main process only
     state = PartialState()
@@ -850,6 +922,39 @@ if __name__ == "__main__":
         train_config = TrainConfig.from_yaml(args.config)
         download_gdrive_files(train_config.gdrive_files)
     print(train_config)
+
+    # Group rotation: pick this run's group of moshafs
+    session_idx = None
+    is_final_session = True
+    if train_config.train_moshaf_groups:
+        session_idx, total_sessions = get_rotation_session(train_config)
+        if args.rotation_remaining:
+            print(f"REMAINING={max(total_sessions - session_idx, 0)}")
+            raise SystemExit(0)
+        if session_idx >= total_sessions:
+            print(f"All {total_sessions} rotation runs are done, nothing to train")
+            raise SystemExit(0)
+        groups = train_config.train_moshaf_groups
+        train_config.train_moshaf_ids = groups[session_idx % len(groups)]
+        is_final_session = session_idx == total_sessions - 1
+        print(
+            f"Rotation run {session_idx + 1}/{total_sessions}: "
+            f"group {session_idx % len(groups)} = {train_config.train_moshaf_ids}"
+        )
+    elif args.rotation_remaining:
+        print("REMAINING=-1")  # no rotation: a single run
+        raise SystemExit(0)
+
+    if args.prepare_data_only:
+        prepare_dataset(train_config, None, None)
+        if args.free_download_cache:
+            free_dataset_download_cache()
+        if train_config.test_moshaf_ids is not None and is_final_session:
+            prepare_dataset(train_config, None, None, is_testset=True)
+            if args.free_download_cache:
+                free_dataset_download_cache()
+        print("Datasets prepared and cached")
+        raise SystemExit(0)
     multi_level_tokenizer = MultiLevelTokenizer("./")
 
     with open("./vocab.json", encoding="utf-8") as f:
@@ -897,8 +1002,43 @@ if __name__ == "__main__":
     # turn off watch to log faster
     os.environ["WANDB_WATCH"] = "false"
 
+    # Load dataset (main process first so other ranks reuse the datasets cache)
+    with state.main_process_first():
+        dataset = prepare_dataset(train_config, processor, multi_level_tokenizer)
+
+    # Rotation: train one epoch over this group, continuing the step count of the
+    # previous run's checkpoint (fractional eval/save steps would be relative to the
+    # cumulative max_steps, so use absolute ones)
+    rotation_kwargs = {}
+    if session_idx is not None:
+        last_ckpt = (
+            get_last_checkpoint(train_config.output_dir)
+            if Path(train_config.output_dir).exists()
+            else None
+        )
+        prev_steps = (
+            TrainerState.load_from_json(
+                str(Path(last_ckpt) / "trainer_state.json")
+            ).global_step
+            if last_ckpt
+            else 0
+        )
+        session_steps = math.ceil(
+            len(dataset["train"])
+            / (train_config.per_device_train_batch_size * state.num_processes)
+        )
+        every = max(1, int(session_steps * train_config.save_every))
+        rotation_kwargs = dict(
+            max_steps=prev_steps + session_steps,
+            eval_steps=every,
+            save_steps=every,
+            logging_steps=every,
+            ignore_data_skip=True,  # new data: do not skip already-seen batches
+        )
+        print(f"Rotation steps: {prev_steps} -> {prev_steps + session_steps}")
+
     # Configure training arguments
-    training_args = TrainingArguments(
+    training_args_kwargs = dict(
         seed=train_config.seed,
         output_dir=train_config.output_dir,
         eval_strategy="steps",
@@ -922,6 +1062,7 @@ if __name__ == "__main__":
         bf16=train_config.mixed_precision == "bf16",
         fp16=train_config.mixed_precision == "fp16",
         ddp_find_unused_parameters=train_config.ddp_find_unused_parameters,
+        ddp_timeout=ddp_timeout,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=train_config.num_workers > 0,
         warmup_ratio=train_config.warmup_ratio,
@@ -935,11 +1076,9 @@ if __name__ == "__main__":
         remove_unused_columns=False,
         eval_accumulation_steps=128,  # offload eval logits to CPU each step to prevent GPU OOM from accumulated predictions
     )
+    training_args_kwargs.update(rotation_kwargs)
+    training_args = TrainingArguments(**training_args_kwargs)
     print(training_args)
-
-    # Load dataset (main process first so other ranks reuse the datasets cache)
-    with training_args.main_process_first(desc="prepare train dataset"):
-        dataset = prepare_dataset(train_config, processor, multi_level_tokenizer)
 
     # Initialize label processor
     data_collector = DataCollatorCTCWithPadding(
@@ -967,6 +1106,15 @@ if __name__ == "__main__":
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
+
+    if session_idx is not None:
+        if trainer.is_world_process_zero():
+            with open(Path(train_config.output_dir) / ROTATION_STATE_FILE, "w") as f:
+                json.dump({"next_session": session_idx + 1}, f)
+        if not is_final_session:
+            # test set, qdat_bench and hub push only after the last rotation run
+            wandb.finish()
+            raise SystemExit(0)
 
     # Final evaluation on test set
     test_results_path = Path(train_config.output_dir) / "test_results.json"

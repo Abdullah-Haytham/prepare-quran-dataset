@@ -26,6 +26,18 @@ train_moshaf_ids:
   # - "29.0"
   # - "30.0"
 
+# Kaggle disk can't hold all 22 moshafs (~87 GB download), so each run trains one
+# epoch on one group (~10-13 GB) and resumes from the previous run's checkpoint.
+# Total runs = 7 groups * num_epochs. Progress is kept in <output_dir>/rotation_state.json
+train_moshaf_groups:
+  - ["0.2", "3.0", "11.0"]
+  - ["2.0", "0.0", "27.0"]
+  - ["0.1", "1.0", "9.0"]
+  - ["6.0", "5.0", "22.0"]
+  - ["0.3", "7.0", "24.0"]
+  - ["12.0", "2.1", "8.0"]
+  - ["13.0", "4.0", "26.0", "28.0"]
+
 # Test moshaf IDs (optional)
 test_moshaf_ids:
   - "19.0"
@@ -71,6 +83,8 @@ save_every: 0.2
 # Hardware settings
 # Kaggle has 4 vCPUs shared by 2 GPU processes (collator decodes + augments on CPU)
 num_workers: 2
+# dataset download/filtering uses all 4 CPUs (runs once before training)
+data_num_proc: 4
 
 # T4 has no bf16 support
 mixed_precision: fp16
