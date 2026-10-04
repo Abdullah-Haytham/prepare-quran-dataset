@@ -28,7 +28,8 @@ train_moshaf_ids:
 
 # Kaggle disk can't hold all 22 moshafs (~87 GB download), so each run trains one
 # epoch on one group (~10-13 GB) and resumes from the previous run's checkpoint.
-# Total runs = 7 groups * num_epochs. Progress is kept in <output_dir>/rotation_state.json
+# Total runs = 7 groups * num_epochs; after every 7 runs (one epoch) the model is
+# copied to <output_dir>/epoch-NN (and pushed to the hub folder epoch-NN with --push-to-hub). Progress is kept in <output_dir>/rotation_state.json
 train_moshaf_groups:
   - ["0.2", "3.0", "11.0"]
   - ["2.0", "0.0", "27.0"]
@@ -78,7 +79,7 @@ pre_device_eval_batch_size: 8
 
 # Dataset parameters
 devset_ratio: 0.1
-save_every: 0.2
+save_every: 1.0  # evaluate/save once at the end of each rotation run
 
 # Hardware settings
 # Kaggle has 4 vCPUs shared by 2 GPU processes (collator decodes + augments on CPU)

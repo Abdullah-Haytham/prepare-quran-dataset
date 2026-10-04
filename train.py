@@ -1027,7 +1027,11 @@ if __name__ == "__main__":
             len(dataset["train"])
             / (train_config.per_device_train_batch_size * state.num_processes)
         )
-        every = max(1, int(session_steps * train_config.save_every))
+        if train_config.save_every >= 1:
+            # evaluate/save only at the end of this run
+            every = prev_steps + session_steps
+        else:
+            every = max(1, int(session_steps * train_config.save_every))
         rotation_kwargs = dict(
             max_steps=prev_steps + session_steps,
             eval_steps=every,
@@ -1108,6 +1112,30 @@ if __name__ == "__main__":
         trainer.train()
 
     if session_idx is not None:
+        num_groups = len(train_config.train_moshaf_groups)
+        if (session_idx + 1) % num_groups == 0 and trainer.is_world_process_zero():
+            # Finished a full pass over all groups (one epoch): keep a standalone copy of
+            # the latest weights (not the best ones loaded by load_best_model_at_end)
+            epoch = (session_idx + 1) // num_groups
+            epoch_dir = Path(train_config.output_dir) / f"epoch-{epoch:02d}"
+            last_ckpt = Path(get_last_checkpoint(train_config.output_dir))
+            epoch_dir.mkdir(parents=True, exist_ok=True)
+            for f in last_ckpt.iterdir():
+                if f.name.endswith(".safetensors") or f.name == "config.json":
+                    shutil.copy2(f, epoch_dir / f.name)
+            processor.save_pretrained(epoch_dir)
+            multi_level_tokenizer.get_tokenizer().save_pretrained(epoch_dir)
+            print(f"Saved epoch {epoch} model ({last_ckpt.name}) to {epoch_dir}")
+            if args.push_to_hub:
+                HfApi().upload_folder(
+                    folder_path=str(epoch_dir),
+                    path_in_repo=epoch_dir.name,
+                    repo_id=train_config.hub_model_id,
+                    repo_type="model",
+                    commit_message=f"epoch {epoch} ({last_ckpt.name})",
+                )
+                print(f"Uploaded {epoch_dir.name} to {train_config.hub_model_id}")
+
         if trainer.is_world_process_zero():
             with open(Path(train_config.output_dir) / ROTATION_STATE_FILE, "w") as f:
                 json.dump({"next_session": session_idx + 1}, f)
