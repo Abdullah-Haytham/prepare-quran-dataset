@@ -2,7 +2,7 @@
 # Train on Kaggle with 2x T4 GPUs (DDP via torchrun).
 #
 # Notebook settings: Accelerator = "GPU T4 x2", Internet = On.
-# Add Kaggle Secrets: WANDB_API_KEY, HUGGINGFACE_TOKEN
+# Add Kaggle Secrets: WANDB_API_KEY, HF_TOKEN
 #
 # Notebook cells:
 #   !git clone -b saudicomp <repo-url> /kaggle/working/prepare-quran-dataset

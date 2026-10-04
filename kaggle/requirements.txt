@@ -2,7 +2,7 @@ transformers>=5.9.0
 accelerate>=1.13
 datasets[audio]==4.8.5
 quran-transcript==0.1.2
-qdat-bench
+qdat-bench @ git+https://github.com/obadx/qdat_bench.git@e8aa630fc988a4eade0225fb965d05f955ecdf86
 audiomentations>=0.43.1
 pyroomacoustics>=0.10.1
 fast_mp3_augment
