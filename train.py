@@ -3,6 +3,9 @@
 from pathlib import Path
 import json
 import os
+import math
+import shutil
+from datetime import timedelta
 import yaml
 import random
 from typing import List, Union, Dict, Literal
@@ -17,6 +20,7 @@ import wandb
 from transformers import (
     TrainingArguments,
     Trainer,
+    TrainerCallback,
     AutoFeatureExtractor,
     AutoConfig,
     AutoModel,
@@ -30,6 +34,7 @@ from numpy.typing import NDArray
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from torch.utils.data import default_collate
 import torch
+import torch.distributed as dist
 from torch.nn import CrossEntropyLoss
 from pydantic import BaseModel, field_validator, model_validator
 
@@ -64,6 +69,11 @@ from qdat_bench.audio_utils import decode_audio
 from qdat_bench.eval_results import eval_qdat_bench
 from huggingface_hub import HfApi
 from tqdm import tqdm
+from accelerate import PartialState
+from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_callback import TrainerState
+
+from gdrive_download import download_gdrive_files, maybe_download_config
 
 
 # TODO:
@@ -111,6 +121,21 @@ class TrainConfig(BaseModel):
     base_model_name_or_path: str = "facebook/w2v-bert-2.0"
     processor_name_or_path: str = "facebook/w2v-bert-2.0"
     ignore_mismatched_sizes: bool = True
+    # T4 / older GPUs do not support bf16 -> use fp16
+    mixed_precision: Literal["bf16", "fp16", "no"] = "bf16"
+    ddp_find_unused_parameters: bool = False
+    # {target_dir: {filename: google_drive_link}} downloaded before training
+    gdrive_files: dict[str, dict[str, str]] | None = None
+    # processes for dataset download/filtering (defaults to num_workers)
+    data_num_proc: int | None = None
+    # Disk-limited machines (e.g. Kaggle): each run trains on one group of moshafs
+    # (overriding `train_moshaf_ids`) and resumes from the previous run's checkpoint.
+    # Total runs = len(train_moshaf_groups) * num_epochs; each run is one epoch over its group.
+    train_moshaf_groups: list[list[str]] | None = None
+    # "steps": eval/save every `save_every` (fraction of training);
+    # "epoch": eval/save every epoch and keep a copy of each epoch's model in <output_dir>/epoch-NN
+    save_strategy: Literal["steps", "epoch"] = "steps"
+    logging_steps: int = 50  # only used with save_strategy: epoch
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "TrainConfig":
@@ -167,6 +192,8 @@ class TrainConfig(BaseModel):
             self.num_workers = min(
                 os.cpu_count() or 1, self.per_device_train_batch_size
             )
+        if self.data_num_proc is None:
+            self.data_num_proc = self.num_workers
         return self
 
 
@@ -364,6 +391,41 @@ def build_audiomentations_augs(p=0.4, seed=42, all=False):
     return SomeOf((1, 3), transforms=transforms, p=p)
 
 
+class EpochSnapshotCallback(TrainerCallback):
+    """With save_strategy "epoch": copy each epoch's checkpoint weights into
+    <output_dir>/epoch-NN (never deleted by save_total_limit), optionally pushing
+    it to the hub folder epoch-NN."""
+
+    def __init__(self, output_dir, processor, tokenizer, hub_model_id=None):
+        self.output_dir = Path(output_dir)
+        self.processor = processor
+        self.tokenizer = tokenizer
+        self.hub_model_id = hub_model_id
+
+    def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        ckpt_dir = self.output_dir / f"checkpoint-{state.global_step}"
+        epoch = round(state.epoch)
+        epoch_dir = self.output_dir / f"epoch-{epoch:02d}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+        for f in ckpt_dir.iterdir():
+            if f.name.endswith(".safetensors") or f.name == "config.json":
+                shutil.copy2(f, epoch_dir / f.name)
+        self.processor.save_pretrained(epoch_dir)
+        self.tokenizer.save_pretrained(epoch_dir)
+        print(f"Saved epoch {epoch} model ({ckpt_dir.name}) to {epoch_dir}")
+        if self.hub_model_id:
+            HfApi().upload_folder(
+                folder_path=str(epoch_dir),
+                path_in_repo=epoch_dir.name,
+                repo_id=self.hub_model_id,
+                repo_type="model",
+                commit_message=f"epoch {epoch} ({ckpt_dir.name})",
+            )
+            print(f"Uploaded {epoch_dir.name} to {self.hub_model_id}")
+
+
 class Augment(object):
     def __init__(
         self,
@@ -398,29 +460,61 @@ class Augment(object):
         return item
 
 
+TRAIN_DATASET_ID = "obadx/muaalem-annotated-v3"
+
+
+def free_dataset_download_cache(dataset_id: str = TRAIN_DATASET_ID):
+    """Delete the downloaded parquet files of `dataset_id` from the HF hub cache.
+    The prepared arrow files (datasets cache) are kept and are all training needs."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    path = Path(HF_HUB_CACHE) / f"datasets--{dataset_id.replace('/', '--')}"
+    if path.exists():
+        shutil.rmtree(path)
+        print(f"Deleted download cache: {path}")
+
+
+ROTATION_STATE_FILE = "rotation_state.json"
+
+
+def get_rotation_session(train_config: TrainConfig) -> tuple[int, int]:
+    """Returns (index of the current run, total number of runs) for group rotation."""
+    state_path = Path(train_config.output_dir) / ROTATION_STATE_FILE
+    session_idx = 0
+    if state_path.exists():
+        with open(state_path) as f:
+            session_idx = json.load(f)["next_session"]
+    total = len(train_config.train_moshaf_groups) * train_config.num_epochs
+    return session_idx, total
+
+
 def prepare_dataset(
     train_config: TrainConfig,
     processor,
     multi_level_tokenizer: MultiLevelTokenizer,
     sample_rate=16000,
     is_testset=False,
+    free_download_cache=False,
 ):
     if is_testset:
         moshaf_ids = train_config.test_moshaf_ids
     else:
         moshaf_ids = train_config.train_moshaf_ids
     # concatenate datasets
-    ds = concatenate_datasets(
-        [
+    moshaf_datasets = []
+    for m_id in moshaf_ids:
+        moshaf_datasets.append(
             load_dataset(
-                "obadx/muaalem-annotated-v3",
+                TRAIN_DATASET_ID,
                 name=f"moshaf_{m_id}",
                 split="train",
-                num_proc=train_config.num_workers,
+                num_proc=train_config.data_num_proc,
             )
-            for m_id in moshaf_ids
-        ]
-    )
+        )
+        if free_download_cache:
+            # the prepared arrow files are kept; the downloaded parquet files are not needed
+            free_dataset_download_cache()
+    ds = concatenate_datasets(moshaf_datasets)
 
     # disable torchcodec decoding, use liborsa instead
     ds = ds.cast_column("audio", Audio(decode=False))
@@ -433,10 +527,18 @@ def prepare_dataset(
         wav, _ = librosa.load(src, sr=16000, mono=True)
         return len(wav)
 
-    ds = ds.filter(
-        lambda ex: _audio_len(ex["audio"]) <= max_samples,
-        num_proc=train_config.num_workers,
-    )
+    if "duration_seconds" in ds.column_names:
+        # use the stored duration instead of decoding every audio file
+        ds = ds.filter(
+            lambda d: d <= train_config.max_audio_seconds,
+            input_columns="duration_seconds",
+            num_proc=train_config.data_num_proc,
+        )
+    else:
+        ds = ds.filter(
+            lambda ex: _audio_len(ex["audio"]) <= max_samples,
+            num_proc=train_config.data_num_proc,
+        )
 
     # # Add augmentations
     # if not is_testset:
@@ -488,6 +590,23 @@ def register_model():
     )
 
 
+def load_backbone_checked(model_cls, path: str, max_missing_ratio=0.5, **kwargs):
+    """`from_pretrained` that fails when most backbone weights are missing
+    (e.g. a w2v-bert checkpoint loaded into a w2v2 model) instead of silently
+    training from random init."""
+    model, info = model_cls.from_pretrained(path, output_loading_info=True, **kwargs)
+    backbone_keys = [k for k in model.state_dict() if "lm_head" not in k]
+    missing = [k for k in info["missing_keys"] if "lm_head" not in k]
+    if backbone_keys and len(missing) / len(backbone_keys) > max_missing_ratio:
+        raise ValueError(
+            f"{len(missing)}/{len(backbone_keys)} backbone weights are missing from `{path}` "
+            f"for `{model_cls.__name__}`. The checkpoint does not match the selected "
+            f"`architecture`. Example missing keys: {missing[:5]}, "
+            f"unexpected keys: {info['unexpected_keys'][:5]}"
+        )
+    return model
+
+
 def build_model_components(
     train_config: TrainConfig,
     level_to_vocab_size: dict[str, int],
@@ -519,14 +638,16 @@ def build_model_components(
 
     if train_config.architecture == "w2v2bert":
         config = Wav2Vec2BertForMultilevelCTCConfig(**common_config_kwargs)
-        model = Wav2Vec2BertForMultilevelCTC.from_pretrained(
+        model = load_backbone_checked(
+            Wav2Vec2BertForMultilevelCTC,
             train_config.base_model_name_or_path,
             config=config,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
         )
     elif train_config.architecture == "w2v2":
         config = Wav2Vec2ForMultilevelCTCConfig(**common_config_kwargs)
-        model = Wav2Vec2ForMultilevelCTC.from_pretrained(
+        model = load_backbone_checked(
+            Wav2Vec2ForMultilevelCTC,
             train_config.base_model_name_or_path,
             config=config,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
@@ -547,7 +668,8 @@ def build_model_components(
             ctc_loss_reduction="mean",
         )
         config = WhisperEncoderForMultilevelCTCConfig(**whisper_kwargs)
-        model = WhisperEncoderForMultilevelCTC.from_pretrained(
+        model = load_backbone_checked(
+            WhisperEncoderForMultilevelCTC,
             train_config.base_model_name_or_path,
             config=config,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
@@ -720,9 +842,12 @@ def run_qdat_bench_test(
     with torch.no_grad():
         for batch in tqdm(dataloader):
             ids = batch.pop("id")
-            batch = {k: v.to(device, dtype=dtype) for k, v in batch.items()}
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-            outputs = model(**batch)
+            with torch.autocast(
+                device_type=device.type, dtype=dtype, enabled=dtype != torch.float32
+            ):
+                outputs = model(**batch)
             level_to_logits = outputs[0]
 
             level_to_labels = {}
@@ -806,13 +931,78 @@ if __name__ == "__main__":
         action="store_true",
         help="Force re-run qdat_bench inference + evaluation even if results exist",
     )
+    parser.add_argument(
+        "--prepare-data-only",
+        action="store_true",
+        help="Download the model files and build the datasets cache, then exit (run before torchrun)",
+    )
+    parser.add_argument(
+        "--free-download-cache",
+        action="store_true",
+        help="With --prepare-data-only: delete the downloaded parquet files after preparing (saves disk)",
+    )
+    parser.add_argument(
+        "--rotation-remaining",
+        action="store_true",
+        help="Print `REMAINING=<n>` rotation runs left (-1 without train_moshaf_groups) and exit",
+    )
     args = parser.parse_args()
 
     # loading wandb tokens ans HF login
     load_secrets()
     register_model()
-    train_config = TrainConfig.from_yaml(args.config)
+
+    # Init the process group ourselves: the default NCCL timeout (10 min) is shorter
+    # than the main-process-only steps (e.g. dataset filtering) the other ranks wait for
+    ddp_timeout = int(os.environ.get("DDP_TIMEOUT", 6 * 3600))
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1 and not dist.is_initialized():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        dist.init_process_group(backend="nccl", timeout=timedelta(seconds=ddp_timeout))
+
+    # Download config and model files (Google Drive) on the local main process only
+    state = PartialState()
+    with state.local_main_process_first():
+        args.config = maybe_download_config(args.config)
+        train_config = TrainConfig.from_yaml(args.config)
+        download_gdrive_files(train_config.gdrive_files)
     print(train_config)
+
+    # Group rotation: pick this run's group of moshafs
+    session_idx = None
+    is_final_session = True
+    if train_config.train_moshaf_groups:
+        session_idx, total_sessions = get_rotation_session(train_config)
+        if args.rotation_remaining:
+            print(f"REMAINING={max(total_sessions - session_idx, 0)}")
+            raise SystemExit(0)
+        if session_idx >= total_sessions:
+            print(f"All {total_sessions} rotation runs are done, nothing to train")
+            raise SystemExit(0)
+        groups = train_config.train_moshaf_groups
+        train_config.train_moshaf_ids = groups[session_idx % len(groups)]
+        is_final_session = session_idx == total_sessions - 1
+        print(
+            f"Rotation run {session_idx + 1}/{total_sessions}: "
+            f"group {session_idx % len(groups)} = {train_config.train_moshaf_ids}"
+        )
+    elif args.rotation_remaining:
+        print("REMAINING=-1")  # no rotation: a single run
+        raise SystemExit(0)
+
+    if args.prepare_data_only:
+        prepare_dataset(
+            train_config, None, None, free_download_cache=args.free_download_cache
+        )
+        if train_config.test_moshaf_ids is not None and is_final_session:
+            prepare_dataset(
+                train_config,
+                None,
+                None,
+                is_testset=True,
+                free_download_cache=args.free_download_cache,
+            )
+        print("Datasets prepared and cached")
+        raise SystemExit(0)
     multi_level_tokenizer = MultiLevelTokenizer("./")
 
     with open("./vocab.json", encoding="utf-8") as f:
@@ -846,8 +1036,9 @@ if __name__ == "__main__":
         ex["id"]: MoshafAttributes(**ex) for ex in moshaf_dataeet
     }
 
-    processor.push_to_hub(train_config.hub_model_id)
-    multi_level_tokenizer.get_tokenizer().push_to_hub(train_config.hub_model_id)
+    if state.is_main_process:
+        processor.push_to_hub(train_config.hub_model_id)
+        multi_level_tokenizer.get_tokenizer().push_to_hub(train_config.hub_model_id)
 
     # Initializaze wanddb
     # set the wandb project where this run will be logged
@@ -859,20 +1050,59 @@ if __name__ == "__main__":
     # turn off watch to log faster
     os.environ["WANDB_WATCH"] = "false"
 
-    # Load dataset
-    # Update with your dataset path
-    dataset = prepare_dataset(train_config, processor, multi_level_tokenizer)
+    # Load dataset (main process first so other ranks reuse the datasets cache)
+    with state.main_process_first():
+        dataset = prepare_dataset(train_config, processor, multi_level_tokenizer)
+
+    # Rotation: train one epoch over this group, continuing the step count of the
+    # previous run's checkpoint (fractional eval/save steps would be relative to the
+    # cumulative max_steps, so use absolute ones)
+    rotation_kwargs = {}
+    if session_idx is not None:
+        last_ckpt = (
+            get_last_checkpoint(train_config.output_dir)
+            if Path(train_config.output_dir).exists()
+            else None
+        )
+        prev_steps = (
+            TrainerState.load_from_json(
+                str(Path(last_ckpt) / "trainer_state.json")
+            ).global_step
+            if last_ckpt
+            else 0
+        )
+        session_steps = math.ceil(
+            len(dataset["train"])
+            / (train_config.per_device_train_batch_size * state.num_processes)
+        )
+        if train_config.save_every >= 1:
+            # evaluate/save only at the end of this run
+            every = prev_steps + session_steps
+        else:
+            every = max(1, int(session_steps * train_config.save_every))
+        rotation_kwargs = dict(
+            max_steps=prev_steps + session_steps,
+            eval_steps=every,
+            save_steps=every,
+            logging_steps=every,
+            ignore_data_skip=True,  # new data: do not skip already-seen batches
+        )
+        print(f"Rotation steps: {prev_steps} -> {prev_steps + session_steps}")
 
     # Configure training arguments
-    training_args = TrainingArguments(
+    training_args_kwargs = dict(
         seed=train_config.seed,
         output_dir=train_config.output_dir,
-        eval_strategy="steps",
+        eval_strategy=train_config.save_strategy,
         eval_steps=train_config.save_every,
-        save_strategy="steps",
+        save_strategy=train_config.save_strategy,
         save_steps=train_config.save_every,
         logging_strategy="steps",
-        logging_steps=train_config.save_every,
+        logging_steps=(
+            train_config.logging_steps
+            if train_config.save_strategy == "epoch"
+            else train_config.save_every
+        ),
         learning_rate=train_config.learning_rate,
         per_device_train_batch_size=train_config.per_device_train_batch_size,
         per_device_eval_batch_size=train_config.pre_device_eval_batch_size,
@@ -885,17 +1115,25 @@ if __name__ == "__main__":
         greater_is_better=train_config.greater_is_better,
         # push_to_hub=True,  # this pushed every checkpoint to the hup we want to push the best model only
         hub_model_id=train_config.hub_model_id,  # Update with your model name
-        bf16=True,
+        bf16=train_config.mixed_precision == "bf16",
+        fp16=train_config.mixed_precision == "fp16",
+        ddp_find_unused_parameters=train_config.ddp_find_unused_parameters,
+        ddp_timeout=ddp_timeout,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=train_config.num_workers > 0,
         warmup_ratio=train_config.warmup_ratio,
         optim="adamw_torch",
         lr_scheduler_type="constant",
         report_to=["tensorboard", "wandb"],
         gradient_checkpointing=train_config.gradient_checkpoiniting,  # Optional for memory savings
+        gradient_checkpointing_kwargs={"use_reentrant": False},  # required for DDP
         save_total_limit=3,
         hub_strategy="all_checkpoints",  # pushes all checkpoints to the Hub with one checkpoint per subfolder in your model repository
         remove_unused_columns=False,
         eval_accumulation_steps=128,  # offload eval logits to CPU each step to prevent GPU OOM from accumulated predictions
     )
+    training_args_kwargs.update(rotation_kwargs)
+    training_args = TrainingArguments(**training_args_kwargs)
     print(training_args)
 
     # Initialize label processor
@@ -917,6 +1155,15 @@ if __name__ == "__main__":
         compute_metrics=compute_metrics,
         data_collator=data_collector,
     )
+    if train_config.save_strategy == "epoch" and session_idx is None:
+        trainer.add_callback(
+            EpochSnapshotCallback(
+                output_dir=train_config.output_dir,
+                processor=processor,
+                tokenizer=multi_level_tokenizer.get_tokenizer(),
+                hub_model_id=train_config.hub_model_id if args.push_to_hub else None,
+            )
+        )
 
     # Start training
     if list(Path(train_config.output_dir).glob("checkpoint-*")):
@@ -924,6 +1171,39 @@ if __name__ == "__main__":
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
+
+    if session_idx is not None:
+        num_groups = len(train_config.train_moshaf_groups)
+        if (session_idx + 1) % num_groups == 0 and trainer.is_world_process_zero():
+            # Finished a full pass over all groups (one epoch): keep a standalone copy of
+            # the latest weights (not the best ones loaded by load_best_model_at_end)
+            epoch = (session_idx + 1) // num_groups
+            epoch_dir = Path(train_config.output_dir) / f"epoch-{epoch:02d}"
+            last_ckpt = Path(get_last_checkpoint(train_config.output_dir))
+            epoch_dir.mkdir(parents=True, exist_ok=True)
+            for f in last_ckpt.iterdir():
+                if f.name.endswith(".safetensors") or f.name == "config.json":
+                    shutil.copy2(f, epoch_dir / f.name)
+            processor.save_pretrained(epoch_dir)
+            multi_level_tokenizer.get_tokenizer().save_pretrained(epoch_dir)
+            print(f"Saved epoch {epoch} model ({last_ckpt.name}) to {epoch_dir}")
+            if args.push_to_hub:
+                HfApi().upload_folder(
+                    folder_path=str(epoch_dir),
+                    path_in_repo=epoch_dir.name,
+                    repo_id=train_config.hub_model_id,
+                    repo_type="model",
+                    commit_message=f"epoch {epoch} ({last_ckpt.name})",
+                )
+                print(f"Uploaded {epoch_dir.name} to {train_config.hub_model_id}")
+
+        if trainer.is_world_process_zero():
+            with open(Path(train_config.output_dir) / ROTATION_STATE_FILE, "w") as f:
+                json.dump({"next_session": session_idx + 1}, f)
+        if not is_final_session:
+            # test set, qdat_bench and hub push only after the last rotation run
+            wandb.finish()
+            raise SystemExit(0)
 
     # Final evaluation on test set
     test_results_path = Path(train_config.output_dir) / "test_results.json"
@@ -933,21 +1213,30 @@ if __name__ == "__main__":
                 f"Found existing {test_results_path}, skipping test evaluation. Use --rerun-testset to force."
             )
         else:
-            testset = prepare_dataset(
-                train_config, processor, multi_level_tokenizer, is_testset=True
-            )
+            with training_args.main_process_first(desc="prepare test dataset"):
+                testset = prepare_dataset(
+                    train_config, processor, multi_level_tokenizer, is_testset=True
+                )
+            # evaluate is collective: must run on all ranks
             test_results = trainer.evaluate(testset["test"], metric_key_prefix="test_")
-            with open(test_results_path, "w") as f:
-                json.dump(test_results, f, indent=4)
-            print("Test Results:", test_results)
+            if trainer.is_world_process_zero():
+                with open(test_results_path, "w") as f:
+                    json.dump(test_results, f, indent=4)
+                print("Test Results:", test_results)
 
     # QDAT benchmark evaluation
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16
+    device = trainer.args.device
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "no": torch.float32,
+    }[train_config.mixed_precision]
     qdat_pred_path = Path(train_config.output_dir) / "qdat_bench_predictions.jsonl"
     qdat_results_path = Path(train_config.output_dir) / "qdat_bench_test_results.json"
 
-    if qdat_results_path.exists() and not args.rerun_qdat_bench:
+    if not trainer.is_world_process_zero():
+        pass  # qdat_bench runs on the main process only
+    elif qdat_results_path.exists() and not args.rerun_qdat_bench:
         print(
             f"Found existing {qdat_results_path}, skipping qdat_bench. Use --rerun-qdat-bench to force."
         )
@@ -985,7 +1274,7 @@ if __name__ == "__main__":
         api = HfApi()
         for fname in ["test_results.json", "qdat_bench_test_results.json"]:
             fpath = Path(train_config.output_dir) / fname
-            if fpath.exists():
+            if trainer.is_world_process_zero() and fpath.exists():
                 api.upload_file(
                     path_or_fileobj=str(fpath),
                     path_in_repo=fname,

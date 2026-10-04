@@ -66,6 +66,7 @@ annotate = [
   "fast_mp3_augment",
   "tensorboard",
   "qdat-bench",
+  "gdown",
 ]
 
 test_streaming = [
