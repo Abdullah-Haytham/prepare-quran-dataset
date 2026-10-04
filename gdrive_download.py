@@ -13,6 +13,7 @@ Usage (pre-download / debugging):
 
 from pathlib import Path
 import argparse
+import re
 
 import yaml
 
@@ -21,12 +22,23 @@ def _is_url(s: str) -> bool:
     return s.startswith("http://") or s.startswith("https://")
 
 
+def _drive_file_id(url: str) -> str | None:
+    """Extract the file id from `.../file/d/<id>/view?...` or `...?id=<id>` links."""
+    match = re.search(r"/file/d/([-\w]+)", url) or re.search(r"[?&]id=([-\w]+)", url)
+    return match.group(1) if match else None
+
+
 def _download(url: str, out_path: Path):
     import gdown
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # fuzzy=True accepts "share" links and handles the large-file confirmation page
-    result = gdown.download(url, str(out_path), fuzzy=True, quiet=False)
+    # pass the file id (supported by all gdown versions; `fuzzy` was removed in gdown 6)
+    # gdown handles the large-file confirmation page
+    file_id = _drive_file_id(url)
+    if file_id is not None:
+        result = gdown.download(id=file_id, output=str(out_path), quiet=False)
+    else:
+        result = gdown.download(url, str(out_path), quiet=False)
     if result is None or not out_path.exists():
         raise RuntimeError(
             f"Failed to download `{url}` -> `{out_path}`. "
