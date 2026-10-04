@@ -529,8 +529,10 @@ def prepare_dataset(
 
     if "duration_seconds" in ds.column_names:
         # use the stored duration instead of decoding every audio file
+        # (capture a plain float: the pydantic config can't be pickled for num_proc workers)
+        max_seconds = float(train_config.max_audio_seconds)
         ds = ds.filter(
-            lambda d: d <= train_config.max_audio_seconds,
+            lambda d: d <= max_seconds,
             input_columns="duration_seconds",
             num_proc=train_config.data_num_proc,
         )
