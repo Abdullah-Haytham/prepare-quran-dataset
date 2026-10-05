@@ -49,14 +49,14 @@ max_audio_seconds: 20.0
 dropout: 0.0
 
 # Model architecture (defaults match w2v-bert-2.0)
-num_hidden_layers: 24
+num_hidden_layers: 16  # must match the pruned checkpoint's config.json
 hidden_size: 384
 output_hidden_size: 384
 intermediate_size: 1536
 num_attention_heads: 6
 
 # Training parameters
-num_epochs: 30
+num_epochs: 10  # do not change when resuming: it sets the total number of steps
 learning_rate: 5e-5
 seed: 42
 
@@ -65,6 +65,7 @@ seed: 42
 # keeps batch x heads x T x T scores (T ~ 1000 frames for 20 s). Without gradient
 # checkpointing batch 16 runs out of memory; with it, only one layer's activations live
 # at a time. If memory stays < ~60% on long batches, try 24-32.
+# do not change when resuming: steps per epoch depend on it
 per_device_train_batch_size: 16
 pre_device_eval_batch_size: 16
 
@@ -111,7 +112,7 @@ processor_name_or_path: "./w2v2bert-384"  # SeamlessM4TFeatureExtractor
 ignore_mismatched_sizes: false
 
 # Gradint checkpointing
-gradient_checkpoiniting: true  # required on L4: batch 16 without it runs out of memory
+gradient_checkpoiniting: true  # required on L4 (22 GB); can be false on L40S (48 GB) - does not affect resuming
 
 # Output directory for checkpoints
 output_dir: "./results-w2v2bert-384"
