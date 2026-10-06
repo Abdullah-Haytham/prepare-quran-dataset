@@ -56,8 +56,12 @@ intermediate_size: 1536
 num_attention_heads: 6
 
 # Training parameters
-num_epochs: 10  # do not change when resuming: it sets the total number of steps
+# total epochs: raising it after training finished continues from the last epoch
+# checkpoint (10 done -> 12 trains 2 more); don't change it mid-epoch
+num_epochs: 12
 learning_rate: 5e-5
+# anneal the LR linearly from 5e-5 to 0 over epochs 11-12 (constant before)
+lr_decay_start_epoch: 10
 seed: 42
 
 # Batch sizes

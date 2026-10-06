@@ -139,6 +139,9 @@ class TrainConfig(BaseModel):
     # zero out infinite CTC losses (targets longer than the output frames) instead of
     # letting them turn the gradients into NaN
     ctc_zero_infinity: bool = False
+    # Constant LR until this epoch, then linear decay to 0 at the end of training
+    # (e.g. 10 with num_epochs 12: anneal over the last 2 epochs). None: constant LR.
+    lr_decay_start_epoch: float | None = None
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "TrainConfig":
@@ -427,6 +430,38 @@ class EpochSnapshotCallback(TrainerCallback):
                 commit_message=f"epoch {epoch} ({ckpt_dir.name})",
             )
             print(f"Uploaded {epoch_dir.name} to {self.hub_model_id}")
+
+
+class LRTailDecayTrainer(Trainer):
+    """Constant learning rate until `lr_decay_start_epoch`, then linear decay to 0 at the
+    last step. Works when resuming: the checkpoint's scheduler state (step, base LR) is
+    loaded into this scheduler."""
+
+    def __init__(self, *args, lr_decay_start_epoch=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lr_decay_start_epoch = lr_decay_start_epoch
+
+    def create_scheduler(self, num_training_steps, optimizer=None):
+        if self.lr_decay_start_epoch is None:
+            return super().create_scheduler(num_training_steps, optimizer)
+        if self.lr_scheduler is None:
+            start = int(
+                num_training_steps
+                * self.lr_decay_start_epoch
+                / self.args.num_train_epochs
+            )
+
+            def factor(step):
+                if step < start:
+                    return 1.0
+                return max(0.0, (num_training_steps - step) / max(1, num_training_steps - start))
+
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer if optimizer is not None else self.optimizer, factor
+            )
+            self._created_lr_scheduler = True
+            print(f"LR: constant until step {start}, then linear decay to 0 at step {num_training_steps}")
+        return self.lr_scheduler
 
 
 class SkipNonFiniteGradCallback(TrainerCallback):
@@ -1178,7 +1213,10 @@ if __name__ == "__main__":
     )
 
     # Initialize Trainer
-    trainer = Trainer(
+    trainer = LRTailDecayTrainer(
+        lr_decay_start_epoch=(
+            train_config.lr_decay_start_epoch if session_idx is None else None
+        ),
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
