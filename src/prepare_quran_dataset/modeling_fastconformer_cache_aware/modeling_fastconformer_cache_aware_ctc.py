@@ -219,7 +219,13 @@ class MuaalemConformerEncoder(ConformerEncoder):
         re-materializes checkpoint-absent buffers with uninitialized memory,
         and its loader bypasses torch ``load_state_dict`` hooks, so validity
         cannot be tracked with a load-time flag).
+
+        Skipped while exporting: ``bool()`` on a tensor cannot be traced.  The
+        exporter rebuilds and checks the table before tracing instead (see
+        ``fastconformer_export.wrappers``).
         """
+        if torch.compiler.is_exporting():
+            return
         pe = getattr(self.pos_enc, "pe", None)
         valid = False
         if pe is not None and pe.device == device and pe.size(1) >= 2 * input_len - 1:
@@ -394,7 +400,10 @@ class MuaalemConformerEncoder(ConformerEncoder):
                             f"(chunk_size={chunk_size}), so the left context "
                             f"spans whole chunks. Got {att_context_size}."
                         )
-                    if offset is not None:
+                    # ``.item()`` cannot be traced, so this runtime check is skipped
+                    # while exporting; the exported graph's driver enforces it
+                    # (see ``fastconformer_export.streaming_driver``).
+                    if offset is not None and not torch.compiler.is_exporting():
                         if offset[0].item() % chunk_size != 0:
                             raise ValueError(
                                 f"`offset` i.e (max_cache_size - last_cache_size) has to be multiple of `chunk_size` got offset=`{offset[0].item()}`, chunk_size=(attn_context_size[1] + 1) = `{chunk_size}`."

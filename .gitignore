@@ -24,3 +24,5 @@ frontend/temp/
 .env
 .gradio
 recordings/
+# FastConformer LiteRT/ONNX export artifacts
+exports/
