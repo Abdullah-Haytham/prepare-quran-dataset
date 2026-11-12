@@ -103,7 +103,7 @@ were produced with dither on. If int8 misses its limit, bring the numbers back f
 
 Needs the real checkpoint and the `annotate` extra. The easiest route is the Colab notebook
 [`notebooks/fastconformer_export_colab.ipynb`](../notebooks/fastconformer_export_colab.ipynb), which installs `uv.lock` under
-Python 3.14 with `uv` and runs everything below. Its first cell lists what to set up: an HF token secret, a CPU runtime and Drive.
+Python 3.14 with `uv` and runs everything below. Its first cell lists what to set up: an HF token in the Colab secret `HF_TOKEN_MUALEM`, a CPU runtime and Drive.
 
 The test set is about 33k utterances. At batch size 1, five runs of it would take days of CPU time, so the notebook scores a fixed random subset
 (`--max-test-utterances`). That costs little rigor. fp32 equivalence is already settled by fidelity, since identical argmax means identical PER,
@@ -112,6 +112,8 @@ and the int8 gate is on QDAT (159 clips), which always runs in full.
 Validation options:
 
 - `--bundles litert/int8,onnx/fp32` checks only those bundles.
+- Fidelity also runs the four graphs unconverted in PyTorch (`pytorch/split`). Each bundle's `vs_split` numbers are its
+  conversion error alone; the `pytorch/split` row is what the conv-STFT mel changes relative to NeMo's.
 - `--max-test-utterances N` scores a fixed random subset (seed 0) of the test set.
 - PER runs are saved to `validation/per/<run>.json` and reused on a rerun with the same settings. `--no-resume` recomputes them.
 - Running only one check writes `validation/report_<check>.json`; running both writes `validation/report.json`.

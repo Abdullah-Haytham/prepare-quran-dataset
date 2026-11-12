@@ -101,6 +101,49 @@ def _utterances(audio_dir: Path | None, num_qdat: int) -> Iterable[tuple[str, ob
             yield f"qdat/{index}", io.BytesIO(dataset[index]["audio"]["bytes"])
 
 
+SPLIT_REFERENCE = "pytorch/split"
+"""The four wrappers run in PyTorch, with the exported conv-STFT mel.
+
+Comparing a bundle with this measures conversion error alone; comparing this with
+``infer_fastconformer_streaming`` measures what the conv-STFT mel front-end changes."""
+
+
+def _new_stats() -> dict:
+    return {
+        "max_abs_error": 0.0,
+        "frames": 0,
+        "argmax_matches": 0,
+        "non_finite": 0,
+        "max_abs_reference": 0.0,
+    }
+
+
+def _accumulate(s: dict, got: dict, reference: dict, levels, label: str) -> None:
+    for level in levels:
+        if got[level].shape != reference[level].shape:
+            raise RuntimeError(
+                f"{label}, level {level}: shape {got[level].shape} vs "
+                f"reference {reference[level].shape}."
+            )
+        s["non_finite"] += int((~np.isfinite(got[level])).sum())
+        s["max_abs_error"] = max(
+            s["max_abs_error"], float(np.abs(got[level] - reference[level]).max())
+        )
+        s["max_abs_reference"] = max(
+            s["max_abs_reference"], float(np.abs(reference[level]).max())
+        )
+        s["frames"] += got[level].shape[0]
+        s["argmax_matches"] += int(
+            (got[level].argmax(-1) == reference[level].argmax(-1)).sum()
+        )
+
+
+def _finish(s: dict) -> dict:
+    s["argmax_agreement"] = s["argmax_matches"] / max(s["frames"], 1)
+    s["relative_error"] = s["max_abs_error"] / max(s["max_abs_reference"], 1e-12)
+    return s
+
+
 def check_fidelity(
     model,
     processor,
@@ -109,15 +152,23 @@ def check_fidelity(
     audio_dir: Path | None,
     num_qdat: int,
 ) -> dict:
-    """Logit error and argmax agreement per bundle, against the PyTorch streaming path."""
+    """Logit error and argmax agreement per bundle, against the PyTorch streaming path.
+
+    Each bundle is also compared with ``pytorch/split`` (the same graphs, unconverted), which
+    separates conversion error (``vs_split``) from the mel front-end's own difference
+    (the ``pytorch/split`` row).
+    """
     from prepare_quran_dataset.modeling_fastconformer_cache_aware import (
         infer_fastconformer_streaming,
     )
 
-    stats = {
-        name: {"max_abs_error": 0.0, "frames": 0, "argmax_matches": 0, "non_finite": 0}
-        for name in backends
-    }
+    from .wrappers import TorchBackend, build_graph_specs
+
+    specs, _ = build_graph_specs(model, selected_levels=set(geometry.levels))
+    split_backend = TorchBackend(specs)
+
+    stats = {name: _new_stats() for name in (SPLIT_REFERENCE, *backends)}
+    vs_split = {name: _new_stats() for name in backends}
     count = 0
     for name, source in _utterances(audio_dir, num_qdat):
         wave = _load_audio(source)
@@ -127,35 +178,30 @@ def check_fidelity(
             [source], "cpu", torch.float32, model, processor
         )
         reference = {level: value[0].numpy() for level, value in reference.items()}
+        split = stream_waveform(split_backend, geometry, wave)
+        _accumulate(
+            stats[SPLIT_REFERENCE], split, reference, geometry.levels,
+            f"{SPLIT_REFERENCE} on {name}",
+        )
         count += 1
         for bundle, backend in backends.items():
             got = stream_waveform(backend, geometry, wave)
-            s = stats[bundle]
-            for level in geometry.levels:
-                if got[level].shape != reference[level].shape:
-                    raise RuntimeError(
-                        f"{bundle} on {name}, level {level}: shape "
-                        f"{got[level].shape} vs reference {reference[level].shape}."
-                    )
-                s["non_finite"] += int((~np.isfinite(got[level])).sum())
-                s["max_abs_error"] = max(
-                    s["max_abs_error"],
-                    float(np.abs(got[level] - reference[level]).max()),
-                )
-                s["frames"] += got[level].shape[0]
-                s["argmax_matches"] += int(
-                    (got[level].argmax(-1) == reference[level].argmax(-1)).sum()
-                )
+            _accumulate(stats[bundle], got, reference, geometry.levels, f"{bundle} on {name}")
+            _accumulate(vs_split[bundle], got, split, geometry.levels, f"{bundle} on {name}")
         print(f"  fidelity {count}: {name}", flush=True)
 
     for name, s in stats.items():
-        s["argmax_agreement"] = s["argmax_matches"] / max(s["frames"], 1)
+        _finish(s)
+        if name in vs_split:
+            s["vs_split"] = _finish(vs_split[name])
         if name.endswith("/fp32"):
             s["passed"] = (
                 s["max_abs_error"] <= FP32_MAX_LOGIT_ERROR
                 and s["argmax_matches"] == s["frames"]
                 and s["non_finite"] == 0
             )
+        elif name == SPLIT_REFERENCE:
+            s["passed"] = None  # diagnostic only
         else:
             # int8 is judged on PER: small logit shifts are expected and fine.
             s["passed"] = s["non_finite"] == 0
@@ -423,7 +469,11 @@ def main() -> int:
             report["fidelity"] = check_fidelity(
                 model, processor, backends, geometry, args.audio_dir, args.num_qdat_utterances
             )
-            passed &= all(s["passed"] for s in report["fidelity"]["bundles"].values())
+            passed &= all(
+                s["passed"]
+                for s in report["fidelity"]["bundles"].values()
+                if s["passed"] is not None
+            )
         if "per" in checks:
             report["per"] = check_per(
                 model,

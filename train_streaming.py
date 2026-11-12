@@ -1016,7 +1016,7 @@ class StreamingTrainer(Trainer):
 
 
 def prepare_special_moshaf_ways(
-    moshaf_id_to_moshaf_attr: dict[str, dict],
+    moshaf_id_to_moshaf_dict: dict[str, dict],
 ) -> dict[str, dict[str, MoshafAttributes]]:
     moshaf_id_to_seg_moshaf_attr = {
         "6.0": {
