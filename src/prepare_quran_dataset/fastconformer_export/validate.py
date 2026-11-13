@@ -259,12 +259,11 @@ def _run_per(train_streaming, model, processor, testset, suffix, output_dir, tok
     return results
 
 
-def _subset_testset(testset, max_utterances: int | None):
-    """A fixed random subset of the test split, so reruns score the same utterances."""
-    if max_utterances is None or max_utterances >= len(testset["test"]):
-        return testset
-    testset["test"] = testset["test"].shuffle(seed=0).select(range(max_utterances))
-    return testset
+def _subset_testset(dataset, max_utterances: int | None):
+    """A fixed random subset, so reruns score the same utterances."""
+    if max_utterances is None or max_utterances >= len(dataset):
+        return dataset
+    return dataset.shuffle(seed=0).select(range(max_utterances))
 
 
 class PerCache:
@@ -364,19 +363,20 @@ def check_per(
             "obadx/mualem-recitations-annotated", name="moshaf_metadata", split="train"
         )
         moshaf_dict = {example["id"]: example for example in moshaf}
-        testset = train_streaming.prepare_dataset(
+        muaalem_ds = train_streaming.prepare_muaalem_dataset(
             train_config,
-            processor,
-            tokenizer,
-            muaalem_ds=train_streaming.prepare_muaalem_dataset(
-                train_config,
-                {example["id"]: MoshafAttributes(**example) for example in moshaf},
-                train_streaming.prepare_special_moshaf_ways(moshaf_dict),
-                is_testset=True,
-            ),
+            {example["id"]: MoshafAttributes(**example) for example in moshaf},
+            train_streaming.prepare_special_moshaf_ways(moshaf_dict),
             is_testset=True,
         )
-        testset = _subset_testset(testset, max_test_utterances)
+        # Subset before prepare_dataset: its length filter decodes every clip.
+        muaalem_ds = _subset_testset(muaalem_ds, max_test_utterances)
+        # prepare_dataset trims to a multiple of this for batched training eval. Here
+        # every run is batch size 1, so keep every utterance that passes the length filter.
+        train_config.pre_device_eval_batch_size = 1
+        testset = train_streaming.prepare_dataset(
+            train_config, muaalem_ds=muaalem_ds, is_testset=True
+        )
         print(f"Test set: {len(testset['test'])} utterances", flush=True)
 
     output_dir.mkdir(parents=True, exist_ok=True)
